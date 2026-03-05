@@ -54,17 +54,17 @@ def test_build_output_filename_basic():
     - extension
 
     and follow the format:
-        base__<resolution><units>__label.ext
+        base__<resolution><units>.ext
     """
     fname = build_output_filename(
         base="AWC",
         resolution=30,
         units="m",
-        label="basin",
+        prefix="south_manitou",
         ext=".asc"
     )
 
-    assert fname == "AWC__30m__basin.asc"
+    assert fname == "south_manitou__AWC__30m.asc"
 
 
 def test_build_output_filename_normalizes_extension():
@@ -76,8 +76,8 @@ def test_build_output_filename_normalizes_extension():
         base="HSG",
         resolution=325,
         units="ft",
-        label="bounding_box",
+        prefix="south_manitou",
         ext="tif"   # note: missing dot
     )
 
-    assert fname == "HSG__325ft__bounding_box.tif"
+    assert fname == "south_manitou__HSG__325ft.tif"

@@ -146,22 +146,24 @@ def write_geotiff_xr(
     path: Union[str, Path],
     da: xr.DataArray,
     *,
-    profile_kwargs: Optional[Dict] = None,
+    dtype: Optional[str] = None,
+    **rasterio_kwargs,
 ) -> Path:
     """
-    Write an :class:`xarray.DataArray` to a GeoTIFF using ``rioxarray``.
+    Write an xarray.DataArray to GeoTIFF using rioxarray.
 
     Parameters
     ----------
     path : str or pathlib.Path
         Destination .tif path.
     da : xarray.DataArray
-        DataArray with CRS and transform attached via ``.rio`` (see :func:`read_raster_xr`).
-        Must be 2D for single-band output. If it contains a ``"band"`` dimension with >1
-        bands, all bands will be written.
-    profile_kwargs : dict, optional
-        Additional creation options for the GTiff driver, passed via rioxarray
-        (e.g., ``dict(BLOCKXSIZE=256, BLOCKYSIZE=256, COMPRESS="LZW")``).
+        DataArray with CRS and transform attached via ``.rio``.
+    dtype : str, optional
+        Output dtype, e.g., "float32", "int16". If None, rioxarray/rasterio
+        infer dtype from the data.
+    **rasterio_kwargs
+        Rasterio profile keywords (e.g., ``compress="LZW"``, ``tiled=True``,
+        ``blockxsize=256``, ``blockysize=256``).
 
     Returns
     -------
@@ -172,26 +174,20 @@ def write_geotiff_xr(
     ------
     ValueError
         If CRS or transform are missing from the DataArray.
-
-    Notes
-    -----
-    The GeoTIFF writing path via rioxarray is convenient and concise. For more detailed
-    control (tiling, compression, and windowed writes), the legacy :func:`write_geotiff`
-    using rasterio is still available.
-
-    Examples
-    --------
-    >>> da = read_raster_xr("data/hydrosheds_dem__south_manitou.tif")
-    >>> _ = write_geotiff_xr("out/dem_copy.tif", da, profile_kwargs={"COMPRESS": "LZW"})
     """
     path = Path(path)
     if da.rio.crs is None or da.rio.transform() is None:
         raise ValueError("DataArray must have CRS and transform set via .rio.")
 
     os.makedirs(path.parent, exist_ok=True)
-    da.rio.to_raster(path, driver="GTiff", profile_kwargs=profile_kwargs or {})
-    return path
 
+    if dtype is not None:
+        # Ensure DA has requested dtype; NaNs require floating types
+        da = da.astype(dtype)
+
+    # Pass standard rasterio keys directly; do not use profile_kwargs for GTiff
+    da.rio.to_raster(path, driver="GTiff", **rasterio_kwargs)
+    return path
 
 def write_geotiff(path: Union[str, Path], array: np.ndarray, profile: Dict) -> None:
     """
