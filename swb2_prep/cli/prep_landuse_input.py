@@ -1,37 +1,42 @@
+# prep_landuse_input.py
+# -*- coding: utf-8 -*-
 """
-Prepare landuse raster for SWB model input.
+Prepare landuse raster for SWB model input (XR-first pipeline).
 
-This script implements the standard SWB-CLI raster-processing workflow
-defined in NOTES.md and bootstrap_prompt.txt:
+This script implements the SWB2-prep raster-processing workflow:
 
 1. Load project settings
 2. Load the area-of-interest (AOI) polygon or bounding box
-3. Load the input raster
+3. Load the input raster as xarray.DataArray
 4. Reproject → project CRS (if needed)
 5. Resample → project resolution (if needed)
 6. Clip → AOI polygon
 7. Write GeoTIFF + ArcASCII outputs
 8. Print grid metadata for SWB control-file generation
 
-The design is strictly procedural, uses argparse + pathlib, and relies
-only on shared functions in common/.
+Design:
+- Procedural CLI with argparse + pathlib
+- XR-first functions from swb2_prep/common (rioxarray + rasterio under the hood)
 """
 
 import argparse
 from pathlib import Path
 import geopandas as gpd
+from pyproj import CRS as _CRS
 
 from swb2_prep.common.config import load_project_options
 from swb2_prep.common.grids import (
-    reproject_raster,
+    reproject_raster_xr,
     reproject_polygon,
-    resample_raster,
+    resample_raster_xr,
+)
+from swb2_prep.common.ops import (
+    clip_raster_to_polygon_xr,
     create_polygon_from_bbox,
 )
-from swb2_prep.common.ops import clip_raster_to_polygon
 from swb2_prep.common.io import (
-    read_raster,
-    write_geotiff,
+    read_raster_xr,
+    write_geotiff_xr,
     write_arc_ascii,
 )
 from swb2_prep.common.paths import (
@@ -47,10 +52,25 @@ def parse_args() -> argparse.Namespace:
     Returns
     -------
     argparse.Namespace
-        An object containing parsed CLI arguments.
+        Parsed CLI arguments:
+
+        --input : str
+            Input landuse raster (GeoTIFF).
+        --output-dir : str, optional
+            Directory for output files (default from project options).
+        --polygon : str, optional
+            AOI shapefile path.
+        --polygon-name : str, optional
+            Field name used to select AOI polygon.
+        --polygon-value : str, optional
+            Field value used to select AOI polygon.
+        --bbox : float xmin ymin xmax ymax, optional
+            AOI bounding box coordinates in project CRS.
+        --config : str, optional
+            Path to project_options.toml (default: project_options.toml).
     """
     p = argparse.ArgumentParser(
-        description="Prepare landuse raster for SWB project."
+        description="Prepare landuse raster for SWB project (XR-first)."
     )
 
     p.add_argument(
@@ -70,17 +90,14 @@ def parse_args() -> argparse.Namespace:
         "--polygon",
         help="AOI shapefile."
     )
-
     p.add_argument(
         "--polygon-name",
         help="Field name in shapefile used to select polygon (optional)."
     )
-
     p.add_argument(
         "--polygon-value",
         help="Field value used to select polygon (optional)."
     )
-
     p.add_argument(
         "--bbox",
         nargs=4,
@@ -89,7 +106,6 @@ def parse_args() -> argparse.Namespace:
         help="Bounding box coordinates in project CRS."
     )
 
-    
     p.add_argument(
         "--config",
         default="project_options.toml",
@@ -101,51 +117,43 @@ def parse_args() -> argparse.Namespace:
 
 def load_aoi(args: argparse.Namespace, project_crs: str) -> gpd.GeoDataFrame:
     """
-    Load the AOI polygon from a shapefile or a bounding box.
+    Load the AOI polygon from a shapefile or a bounding box, returning a
+    single-row GeoDataFrame in the project CRS.
 
-    The selection rules for shapefile AOIs are:
-
-    1. If both ``--polygon-name`` and ``--polygon-value`` are supplied:
+    Selection rules for shapefile AOIs
+    ----------------------------------
+    1) If both ``--polygon-name`` and ``--polygon-value`` are supplied:
        - Select polygons where the field equals the specified value.
-       - If zero matches → error.
-       - If one match → OK.
-       - If more than one match → error (ambiguous selection).
-
-    2. If *neither* ``--polygon-name`` nor ``--polygon-value`` is supplied:
-       - If shapefile contains exactly one polygon → OK.
-       - If shapefile contains more than one polygon → error.
-
-    3. If only one of ``--polygon-name`` / ``--polygon-value`` is provided:
-       - Error (both must be supplied together).
+       - If zero matches → error; if one match → OK; if >1 → error (ambiguous).
+    2) If neither is supplied:
+       - If shapefile contains exactly one polygon → OK; else → error.
+    3) If only one of the pair is supplied → error.
 
     Parameters
     ----------
     args : argparse.Namespace
         Parsed command-line arguments.
     project_crs : str
-        CRS string of the SWB project.
+        Project CRS string (e.g., "EPSG:5070").
 
     Returns
     -------
     geopandas.GeoDataFrame
-        GeoDataFrame containing exactly one polygon in the project CRS.
+        Single-row GeoDataFrame containing the AOI polygon in ``project_crs``.
 
     Raises
     ------
     ValueError
-        If AOI selection is ambiguous or inconsistent with the options.
+        If AOI selection is ambiguous or inconsistent with options.
     """
     # BOUNDING BOX MODE
     if args.bbox:
         xmin, ymin, xmax, ymax = args.bbox
-        poly = create_polygon_from_bbox(xmin, ymin, xmax, ymax)
-        return gpd.GeoDataFrame(geometry=[poly], crs=project_crs)
+        return create_polygon_from_bbox(xmin, ymin, xmax, ymax, project_crs)
 
     # POLYGON MODE
     if not args.polygon:
-        raise ValueError(
-            "Either --polygon or --bbox must be provided."
-        )
+        raise ValueError("Either --polygon or --bbox must be provided.")
 
     gdf = gpd.read_file(args.polygon)
 
@@ -165,16 +173,12 @@ def load_aoi(args: argparse.Namespace, project_crs: str) -> gpd.GeoDataFrame:
         value = args.polygon_value
 
         if field not in gdf.columns:
-            raise ValueError(
-                f"Field {field!r} not found in shapefile."
-            )
+            raise ValueError(f"Field {field!r} not found in shapefile.")
 
         sel = gdf[gdf[field] == value]
 
         if len(sel) == 0:
-            raise ValueError(
-                f"No polygons found where {field} == {value!r}."
-            )
+            raise ValueError(f"No polygons found where {field} == {value!r}.")
         if len(sel) > 1:
             raise ValueError(
                 f"Multiple polygons match {field} == {value!r}. "
@@ -186,9 +190,7 @@ def load_aoi(args: argparse.Namespace, project_crs: str) -> gpd.GeoDataFrame:
     # Case 2: Neither supplied → require 1 polygon
     elif not has_name and not has_value:
         if len(gdf) == 0:
-            raise ValueError(
-                "Shapefile contains no polygons."
-            )
+            raise ValueError("Shapefile contains no polygons.")
         if len(gdf) > 1:
             raise ValueError(
                 "Shapefile contains multiple polygons; "
@@ -201,16 +203,16 @@ def load_aoi(args: argparse.Namespace, project_crs: str) -> gpd.GeoDataFrame:
 
 def main() -> None:
     """
-    Execute the landuse preprocessing workflow.
+    Execute the landuse preprocessing workflow (XR-first).
 
     Steps
     -----
     1. Read project settings from ``project_options.toml``.
-    2. Load AOI using shapefile or bounding box.
-    3. Read input raster.
+    2. Load AOI using shapefile or bounding box (reproject to project CRS).
+    3. Read input raster as xarray.DataArray.
     4. Reproject raster to project CRS (if needed).
     5. Resample raster to project resolution (if needed).
-    6. Clip raster to AOI.
+    6. Clip raster to AOI polygon.
     7. Write GeoTIFF and ArcASCII outputs.
     8. Print grid metadata for SWB control-file generation.
 
@@ -244,46 +246,32 @@ def main() -> None:
     project_resolution = opts["project"]["resolution"]
     project_units = opts["project"]["units"]
 
-    output_dir = Path(args.output_dir or opts["paths"]["output_dir"])
-    output_dir = ensure_dir(output_dir)
+    output_dir = ensure_dir(Path(args.output_dir or opts["paths"]["output_dir"]))
 
-    # 2. Load AOI
-    aoi = load_aoi(args, project_crs)
+    # 2. Load AOI (GeoDataFrame in project CRS)
+    aoi_gdf = load_aoi(args, project_crs)
 
-    # 3. Load input raster
-    array, profile = read_raster(args.input)
-    input_crs = profile["crs"]
-    input_res = profile["transform"].a  # pixel width
+    # 3. Load input raster as DataArray (CRS/transform via .rio)
+    da = read_raster_xr(args.input)  # masked=True by default (NoData -> NaN)
 
-    # 4. Reproject → project CRS (if needed)
-    if input_crs != project_crs:
-        array, profile = reproject_raster(array, profile, project_crs)
+    # 4/5. Reproject and/or resample to project CRS/resolution
+    if str(da.rio.crs) != str(project_crs):
+        da = reproject_raster_xr(da, project_crs, resolution=project_resolution)
+    else:
+        xres = float(da.rio.transform().a)
+        if abs(xres - project_resolution) > 1e-6:
+            da = resample_raster_xr(da, target_resolution=project_resolution)
 
-    # 5. Resample → project resolution (if needed)
-    if abs(input_res - project_resolution) > 1e-6:
-        array, profile = resample_raster(
-            array,
-            profile,
-            target_resolution=project_resolution
-        )
-
-    # 6. Clip raster → AOI
-    array, profile = clip_raster_to_polygon(
-        array,
-        profile,
-        aoi
-    )
+    # 6. Clip raster to AOI polygon (auto-reprojects AOI if CRSs differ)
+    da = clip_raster_to_polygon_xr(da, aoi_gdf)
 
     # 7. Build output filenames
-    label = "bounding_box" if args.bbox else "polygon"
-
     fname_tif = build_output_filename(
         base="landuse",
         resolution=project_resolution,
         units=project_units,
         ext=".tif",
     )
-
     fname_asc = build_output_filename(
         base="landuse",
         resolution=project_resolution,
@@ -291,16 +279,38 @@ def main() -> None:
         ext=".asc",
     )
 
-    # 8. Write outputs
-    write_geotiff(output_dir / fname_tif, array, profile)
-    write_arc_ascii(output_dir / fname_asc, array, profile)
+    # 8. Write outputs (explicit dtype keeps GeoTIFF predictable)
+    write_geotiff_xr(
+        output_dir / fname_tif,
+        da,
+        dtype="uint8",
+        nodata=255,
+        compress="LZW",
+        tiled=True,
+    )
 
-    # 9. Print control-file metadata
-    nx = array.shape[1]
-    ny = array.shape[0]
-    llx = profile["transform"].c
-    lly = profile["transform"].f
-    proj4 = profile["crs"].to_proj4()
+    write_arc_ascii(
+        output_dir / fname_asc,
+        da,
+        dtype="int16",
+        transform=da.rio.transform(),
+        crs=da.rio.crs,
+        nodata=-9999,
+        decimal_precision=0,
+        force_cellsize=True,
+    )
+
+    # 9. Print control-file metadata (lower-left from upper-left transform)
+    nx = da.sizes["x"]
+    ny = da.sizes["y"]
+    T = da.rio.transform()
+    llx = T.c
+    lly = T.f + T.e * ny  # lower-left y from upper-left transform
+    # proj4 string (robust via pyproj)
+    try:
+        proj4 = _CRS.from_user_input(da.rio.crs).to_proj4()
+    except Exception:
+        proj4 = str(da.rio.crs)
 
     print(nx, ny, llx, lly, project_resolution, proj4)
 

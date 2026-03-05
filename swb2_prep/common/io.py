@@ -7,20 +7,19 @@ compatibility wrappers. The XR-first API returns `xarray.DataArray` objects with
 affine transform, and optional NoData masking attached via `rioxarray`. The compatibility
 wrappers keep legacy code working where NumPy arrays and rasterio profiles are expected.
 
-Functions included:
+Functions included
+------------------
 - read_raster_xr: Read any raster to an xarray.DataArray (CRS/transform attached).
-- read_raster: Legacy: Read a raster to (numpy array, rasterio profile).
-- write_geotiff_xr: Write a DataArray to GeoTIFF via rioxarray.
-- write_geotiff: Legacy: Write a NumPy array to GeoTIFF via rasterio.
-- write_arc_ascii: Write ESRI Arc ASCII Grid (.asc) via rioxarray AAIGrid driver.
+- ensure_dtype_and_nodata: Ensure a DataArray has the requested dtype and a representable nodata.
+- write_geotiff_xr: Write a DataArray to GeoTIFF via rioxarray with explicit dtype/nodata.
+- write_arc_ascii: Write ESRI Arc ASCII Grid (.asc) via rioxarray AAIGrid driver, typed.
 - lower_left_to_transform: Helper to derive an Affine from lower-left origin.
 
 Notes
 -----
 - ESRI ASCII (AAIGrid) is written via GDAL's CreateCopy pathway; precision and formatting
-  can be controlled using GDAL creation options (e.g., DECIMAL_PRECISION). See GDAL docs
-  and examples.  # See project test suite and references in documentation.
-
+  can be controlled using GDAL creation options (e.g., DECIMAL_PRECISION). See the project
+  test suite and documentation for examples.
 """
 
 from __future__ import annotations
@@ -40,6 +39,7 @@ from rasterio.transform import Affine, from_origin
 __all__ = [
     "read_raster_xr",
     "read_raster",
+    "ensure_dtype_and_nodata",
     "write_geotiff_xr",
     "write_geotiff",
     "write_arc_ascii",
@@ -96,74 +96,97 @@ def read_raster_xr(path: Union[str, Path], *, masked: bool = True) -> xr.DataArr
 
     return da
 
-
-def read_raster(path: Union[str, Path]) -> Tuple[np.ndarray, Dict]:
+def ensure_dtype_and_nodata(
+    da: xr.DataArray,
+    *,
+    dtype: str,
+    nodata: Optional[Union[int, float]],
+    auto_cast_float32: bool = False,
+) -> xr.DataArray:
     """
-    Read a raster file using rasterio and return data as a NumPy array plus a metadata profile.
+    Ensure a DataArray has the requested dtype and a representable nodata.
 
     Parameters
     ----------
-    path : str or pathlib.Path
-        Path to the raster file. Must be readable by rasterio (e.g., GeoTIFF).
+    da : xarray.DataArray
+        Input data with CRS/transform via ``.rio``.
+    dtype : str
+        Target dtype (e.g., ``"uint8"``, ``"int16"``, ``"float32"``).
+    nodata : int or float, optional
+        Desired nodata sentinel. Must be representable in ``dtype``.
+    auto_cast_float32 : bool, optional
+        If ``True`` and nodata is not representable in an integer dtype, cast the
+        DataArray to ``float32`` and set nodata as float. If ``False`` (default),
+        raise :class:`ValueError` in that case.
 
     Returns
     -------
-    (numpy.ndarray, dict)
-        * array : 2D NumPy array from the first band.
-        * profile : rasterio profile dict (includes ``crs``, ``transform``, ``width``,
-          ``height``, ``dtype``, ``driver``, and related metadata).
+    xarray.DataArray
+        DataArray cast to ``dtype`` with nodata written via ``.rio.write_nodata``.
 
     Raises
     ------
-    FileNotFoundError
-        If the provided path does not exist.
-    rasterio.errors.RasterioIOError
-        If rasterio fails to read the file.
+    ValueError
+        If the nodata value cannot be represented by the requested dtype
+        and ``auto_cast_float32`` is ``False``.
 
     Notes
     -----
-    This legacy function is kept for compatibility with existing NumPy pipelines. Prefer
-    :func:`read_raster_xr` in new code.
-
-    Examples
-    --------
-    >>> arr, prof = read_raster("data/muraster__south_manitou.tif")
-    >>> arr.ndim
-    2
+    - For integer dtypes, nodata must fall within the dtype range.
+    - For float dtypes, nodata is stored as a float value (e.g., ``-9999.0``).
+    - Use ``auto_cast_float32=True`` when you want to keep a standard float nodata
+      (e.g., ``-9999``) even if the input is categorical integers.
     """
-    path = Path(path)
-    if not path.exists():
-        raise FileNotFoundError(f"Raster not found: {path}")
+    target = np.dtype(dtype)
+    da_out = da.astype(target)
 
-    with rasterio.open(path) as src:
-        array = src.read(1)  # First band
-        profile = src.profile.copy()
+    if nodata is not None:
+        if np.issubdtype(target, np.integer):
+            info = np.iinfo(target)
+            if not (info.min <= nodata <= info.max):
+                if auto_cast_float32:
+                    da_out = da.astype("float32")
+                    da_out = da_out.rio.write_nodata(float(nodata))
+                    return da_out
+                raise ValueError(
+                    f"nodata={nodata} cannot be represented by dtype={dtype} "
+                    f"(range {info.min}..{info.max})"
+                )
+            da_out = da_out.rio.write_nodata(int(nodata))
+        else:
+            da_out = da_out.rio.write_nodata(float(nodata))
 
-    return array, profile
+    return da_out
 
 
 def write_geotiff_xr(
     path: Union[str, Path],
     da: xr.DataArray,
     *,
-    dtype: Optional[str] = None,
+    dtype: str,
+    nodata: Optional[Union[int, float]],
+    auto_cast_float32: bool = False,
     **rasterio_kwargs,
 ) -> Path:
     """
-    Write an xarray.DataArray to GeoTIFF using rioxarray.
+    Write a typed GeoTIFF using rioxarray.
 
     Parameters
     ----------
     path : str or pathlib.Path
-        Destination .tif path.
+        Output GeoTIFF path.
     da : xarray.DataArray
-        DataArray with CRS and transform attached via ``.rio``.
-    dtype : str, optional
-        Output dtype, e.g., "float32", "int16". If None, rioxarray/rasterio
-        infer dtype from the data.
+        DataArray with CRS/transform via ``.rio``.
+    dtype : str
+        Target dtype (e.g., ``"uint8"``, ``"int16"``, ``"float32"``).
+    nodata : int or float, optional
+        Nodata sentinel (must be representable in dtype unless ``auto_cast_float32=True``).
+    auto_cast_float32 : bool, optional
+        If ``True``, automatically cast to float32 when nodata cannot be represented
+        in the requested integer dtype (e.g., ``-9999`` for categorical rasters).
     **rasterio_kwargs
-        Rasterio profile keywords (e.g., ``compress="LZW"``, ``tiled=True``,
-        ``blockxsize=256``, ``blockysize=256``).
+        Rasterio profile options (e.g., ``compress="LZW"``, ``tiled=True``,
+        ``blockxsize=256``).
 
     Returns
     -------
@@ -173,7 +196,8 @@ def write_geotiff_xr(
     Raises
     ------
     ValueError
-        If CRS or transform are missing from the DataArray.
+        If CRS or transform are missing from ``da`` or nodata is incompatible and
+        ``auto_cast_float32=False``.
     """
     path = Path(path)
     if da.rio.crs is None or da.rio.transform() is None:
@@ -181,55 +205,13 @@ def write_geotiff_xr(
 
     os.makedirs(path.parent, exist_ok=True)
 
-    if dtype is not None:
-        # Ensure DA has requested dtype; NaNs require floating types
-        da = da.astype(dtype)
+    da_t = ensure_dtype_and_nodata(
+        da, dtype=dtype, nodata=nodata, auto_cast_float32=auto_cast_float32
+    )
 
-    # Pass standard rasterio keys directly; do not use profile_kwargs for GTiff
-    da.rio.to_raster(path, driver="GTiff", **rasterio_kwargs)
+    # Pass rasterio-style kwargs directly; do not use profile_kwargs for GTiff
+    da_t.rio.to_raster(path, driver="GTiff", **rasterio_kwargs)
     return path
-
-def write_geotiff(path: Union[str, Path], array: np.ndarray, profile: Dict) -> None:
-    """
-    Write a 2D NumPy array to GeoTIFF via rasterio (legacy path).
-
-    Parameters
-    ----------
-    path : str or pathlib.Path
-        Destination GeoTIFF path.
-    array : numpy.ndarray
-        2D array (single-band).
-    profile : dict
-        Rasterio profile including ``driver='GTiff'`` (or will be forced),
-        ``dtype``, ``width``, ``height``, ``crs``, and ``transform``.
-
-    Returns
-    -------
-    None
-
-    Raises
-    ------
-    rasterio.errors.RasterioIOError
-        If the dataset cannot be written.
-
-    Notes
-    -----
-    This path provides detailed control over compression, tiling, and profile tuning
-    when writing GeoTIFFs. For XR-first usage, prefer :func:`write_geotiff_xr`.
-
-    Examples
-    --------
-    >>> arr, prof = read_raster("data/muraster__south_manitou.tif")
-    >>> write_geotiff("out/muraster_copy.tif", arr, prof)
-    """
-    path = Path(path)
-    profile = profile.copy()
-    profile.update({"driver": "GTiff"})
-
-    os.makedirs(path.parent, exist_ok=True)
-    with rasterio.open(path, "w", **profile) as dst:
-        dst.write(array, 1)
-
 
 def lower_left_to_transform(
     xllcorner: float,
@@ -253,6 +235,7 @@ def lower_left_to_transform(
         Pixel width (x resolution).
     y_res : float
         Pixel height (y resolution). For north-up rasters, this should be positive.
+
     Returns
     -------
     rasterio.transform.Affine
@@ -275,40 +258,46 @@ def lower_left_to_transform(
 
 
 def write_arc_ascii(
-    data: Union[np.ndarray, xr.DataArray],
     out_path: Union[str, Path],
+    da: xr.DataArray,
     *,
+    dtype: str,
+    nodata: Optional[Union[int, float]],
     transform: Affine,
-    crs: Union[str, dict],          # e.g., "EPSG:5070" or rasterio-style dict/WKT
-    nodata: Optional[float] = -9999,
+    crs: Union[str, dict],
     decimal_precision: Optional[int] = None,
     significant_digits: Optional[int] = None,
     force_cellsize: Optional[bool] = None,
+    auto_cast_float32: bool = False,
 ) -> Path:
     """
-    Write an ESRI Arc ASCII Grid (AAIGrid, ``.asc``) using ``rioxarray``.
+    Write an ESRI Arc ASCII Grid (AAIGrid, ``.asc``) using ``rioxarray`` with explicit dtype/nodata.
 
     Parameters
     ----------
-    data : numpy.ndarray or xarray.DataArray
-        2D array (rows, cols). If a DataArray has a ``"band"`` dim, it will be squeezed
-        to a single band. If a NumPy array is provided, it will be wrapped as a DataArray
-        with dims ``("y", "x")``.
+    da : xarray.DataArray
+        2D DataArray (rows, cols). If a ``"band"`` dim exists, the first band is selected.
     out_path : str or pathlib.Path
         Destination ASCII grid path (``.asc``).
+    dtype : str
+        Target dtype (e.g., ``"uint8"``, ``"int16"``, ``"float32"``).
+    nodata : int or float, optional
+        Nodata sentinel; must be representable in dtype unless ``auto_cast_float32=True``.
     transform : rasterio.transform.Affine
         Geotransform with origin at the *upper-left* (Rasterio/GDAL convention).
     crs : str or dict
         CRS as EPSG string (e.g., ``"EPSG:32615"``), WKT, or rasterio-style dict.
-    nodata : float or None, optional
-        NoData value to encode in the ASCII file; defaults to ``-9999``.
     decimal_precision : int, optional
-        GDAL AAIGrid creation option: number of decimal places (e.g., ``3`` makes files smaller).
+        GDAL AAIGrid creation option: number of decimal places (e.g., ``0`` for categorical;
+        ``3`` for continuous). Mutually exclusive with ``significant_digits``.
     significant_digits : int, optional
-        GDAL AAIGrid creation option: number of significant digits.
+        GDAL AAIGrid creation option: number of significant digits (alternative to decimals).
     force_cellsize : bool, optional
         GDAL AAIGrid creation option: ``True`` → ``FORCE_CELLSIZE=YES`` to use the X pixel size
         as ``CELLSIZE`` when pixels are not perfectly square.
+    auto_cast_float32 : bool, optional
+        If ``True``, automatically cast to float32 when nodata cannot be represented
+        in the requested integer dtype.
 
     Returns
     -------
@@ -318,62 +307,64 @@ def write_arc_ascii(
     Raises
     ------
     ValueError
-        If ``data`` is not 2D, or CRS/transform are missing when required.
+        If CRS/transform are missing or nodata is incompatible and
+        ``auto_cast_float32=False``.
 
     Notes
     -----
     This uses the GDAL AAIGrid driver via rioxarray's ``to_raster(..., driver="AAIGrid")``.
     Options like ``DECIMAL_PRECISION`` and ``SIGNIFICANT_DIGITS`` are passed through
-    ``profile_kwargs`` to GDAL. For multi-band data, ASCII output is single-band only
-    (first band selected).
+    ``profile_kwargs`` to GDAL. ASCII output is single-band only (first band selected).
 
     Examples
     --------
-    >>> import numpy as np
-    >>> arr = np.random.rand(50, 60).astype("float32")
-    >>> T = lower_left_to_transform(378923, 4072345, 50, 30, 30)
-    >>> _ = write_arc_ascii(arr, "out/synthetic.asc", transform=T, crs="EPSG:32616", decimal_precision=2)
+    >>> # Categorical (uint8) with in-range nodata, no decimals:
+    >>> da8 = read_raster_xr("landuse.tif")
+    >>> T = da8.rio.transform()
+    >>> _ = write_arc_ascii(
+    ...     "out/landuse.asc", da8, dtype="uint8", nodata=255,
+    ...     transform=T, crs=da8.rio.crs, decimal_precision=0, force_cellsize=True
+    ... )
+    >>> # Continuous (float32) with -9999 nodata, 3 decimals:
+    >>> daf = read_raster_xr("awc.tif")
+    >>> _ = write_arc_ascii(
+    ...     "out/awc.asc", daf, dtype="float32", nodata=-9999.0,
+    ...     transform=daf.rio.transform(), crs=daf.rio.crs, decimal_precision=3
+    ... )
     """
     out_path = Path(out_path)
 
-    # --- Normalize to a single-band DataArray ---
-    if isinstance(data, xr.DataArray):
-        da = data
-        if "band" in da.dims:
-            da = da.isel(band=0).squeeze(drop=True)
-    else:
-        # Assume 2D numpy array
-        arr = np.asarray(data)
-        if arr.ndim != 2:
-            raise ValueError("`data` must be a 2D array for AAIGrid.")
-        da = xr.DataArray(arr, dims=("y", "x"), name="band1")
+    # Normalize to single band
+    if "band" in da.dims:
+        da = da.isel(band=0).squeeze(drop=True)
 
-    # --- Attach geospatial metadata via rioxarray ---
-    da = da.rio.write_crs(crs)
-    da = da.rio.write_transform(transform)
-    if nodata is not None:
-        da = da.rio.write_nodata(nodata)
+    # Attach geospatial metadata
+    if crs is None or transform is None:
+        raise ValueError("CRS and transform must be provided for ASCII writing.")
+    da = da.rio.write_crs(crs).rio.write_transform(transform)
 
-    # --- Build GDAL AAIGrid creation options ---
+    # Enforce dtype/nodata (with optional auto-cast)
+    da_t = ensure_dtype_and_nodata(
+        da, dtype=dtype, nodata=nodata, auto_cast_float32=auto_cast_float32
+    )
+
+    # Build GDAL AAIGrid creation options
     options = []
-    if decimal_precision is not None:
+    if decimal_precision is not None and significant_digits is not None:
+        # Avoid conflicting options; prefer decimal_precision when both given
         options.append(f"DECIMAL_PRECISION={int(decimal_precision)}")
-    if significant_digits is not None:
+    elif decimal_precision is not None:
+        options.append(f"DECIMAL_PRECISION={int(decimal_precision)}")
+    elif significant_digits is not None:
         options.append(f"SIGNIFICANT_DIGITS={int(significant_digits)}")
+
     if force_cellsize is not None:
         options.append(f"FORCE_CELLSIZE={'YES' if force_cellsize else 'NO'}")
 
-    profile_kwargs = {}
-    if options:
-        profile_kwargs["options"] = options
+    profile_kwargs = {"options": options} if options else {}
 
     os.makedirs(out_path.parent, exist_ok=True)
 
-    # --- Write ASCII grid ---
-    da.rio.to_raster(
-        out_path,
-        driver="AAIGrid",
-        profile_kwargs=profile_kwargs,
-    )
-
+    # Write ASCII grid
+    da_t.rio.to_raster(out_path, driver="AAIGrid", profile_kwargs=profile_kwargs)
     return out_path

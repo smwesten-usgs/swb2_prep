@@ -13,9 +13,7 @@ import rioxarray as rxr
 
 from swb2_prep.common.io import (
     read_raster_xr,
-    read_raster,
     write_geotiff_xr,
-    write_geotiff,
 )
 
 
@@ -42,7 +40,7 @@ def test_read_xr_and_write_geotiff_xr(tmp_path):
 
     out_tif = tmp_path / "dem_copy.tif"
     # Explicitly set dtype to stabilize round-trip
-    write_geotiff_xr(out_tif, da, dtype="float32", compress="LZW", tiled=True)
+    write_geotiff_xr(out_tif, da, dtype="float32", nodata=-9999., compress="LZW", tiled=True,)
 
     da2 = rxr.open_rasterio(out_tif, masked=False)
     if "band" in da2.dims:
@@ -50,26 +48,3 @@ def test_read_xr_and_write_geotiff_xr(tmp_path):
 
     assert da2.rio.crs == da.rio.crs
     assert _affine_close(da2.rio.transform(), da.rio.transform(), atol=1e-12)
-
-
-def test_legacy_numpy_write_roundtrip(tmp_path):
-    """
-    Use legacy NumPy+profile reader/writer to copy a raster and
-    verify a small window of values round-trips correctly.
-    """
-    data_dir = Path(__file__).resolve().parents[1] / "data"
-    src = data_dir / "muraster__south_manitou.tif"
-
-    arr, prof = read_raster(src)
-    out_tif = tmp_path / "muraster_copy.tif"
-    write_geotiff(out_tif, arr, prof)
-
-    da2 = rxr.open_rasterio(out_tif, masked=False)
-    if "band" in da2.dims:
-        da2 = da2.squeeze("band", drop=True)
-
-    # Metadata checks
-    assert da2.rio.crs == prof["crs"]
-    assert da2.rio.transform() == prof["transform"]
-    # Value check on a small window to avoid edge nodata
-    assert np.allclose(da2.values[100:110, 100:110], arr[100:110, 100:110])

@@ -1,54 +1,59 @@
+# tests/test_io.py
+# -*- coding: utf-8 -*-
+"""
+XR-first IO tests for SWB2 prep.
+
+This module validates:
+- Creating an AOI polygon from a bounding box.
+- Reprojecting a polygon GeoDataFrame to a target CRS.
+- Resampling a raster DataArray to a new resolution in the same CRS.
+- Reprojecting a raster DataArray to a different CRS.
+
+All raster tests construct small synthetic xarray.DataArray objects and attach
+CRS/transform using rioxarray’s `.rio` accessors, avoiding legacy NumPy/profile paths.
+"""
+
 import numpy as np
 import geopandas as gpd
 from shapely.geometry import Polygon
 from rasterio.transform import from_origin
+import xarray as xr
 
-from swb2_prep.common.grids import (
-    reproject_raster,
-    reproject_polygon,
-    resample_raster,
+from swb2_prep.common.ops import (
     create_polygon_from_bbox,
 )
+from swb2_prep.common.grids import (
+    reproject_raster_xr,
+    reproject_polygon,
+    resample_raster_xr,
+)
+
 
 def test_create_polygon_from_bbox():
     """
-    Test creating a bounding-box polygon in project CRS.
+    Create a bounding-box polygon in the project CRS and validate geometry/CRS.
 
-    Inputs
-    ------
-    xmin, ymin, xmax, ymax : floats
-        Coordinates in project CRS.
-    crs : str
-        CRS string.
-
-    Expected Output
-    ---------------
-    A GeoDataFrame with exactly one polygon whose bounding box
-    matches the requested limits.
+    Expected
+    --------
+    - GeoDataFrame has exactly one polygon.
+    - Bounds match the inputs.
+    - CRS equals the requested EPSG.
     """
     gdf = create_polygon_from_bbox(0, 0, 10, 5, "EPSG:5070")
 
     assert len(gdf) == 1
     poly = gdf.geometry.iloc[0]
-#    poly = gdf['geometry']
     assert poly.bounds == (0, 0, 10, 5)
     assert gdf.crs.to_string() == "EPSG:5070"
 
+
 def test_reproject_polygon():
     """
-    Test polygon reprojection with GeoPandas.
+    Reproject a simple polygon GeoDataFrame from EPSG:4326 to EPSG:5070.
 
-    Inputs
-    ------
-    gdf : GeoDataFrame
-        With a simple rectangle and CRS EPSG:4326.
-    target_crs : str
-        "EPSG:5070"
-
-    Expected Output
-    ---------------
-    A reprojected GeoDataFrame with CRS EPSG:5070 and a polygon
-    in projected coordinates.
+    Expected
+    --------
+    - Output GeoDataFrame CRS equals EPSG:5070.
     """
     gdf = gpd.GeoDataFrame(
         {"geometry": [Polygon([(0, 0), (1, 0), (1, 1), (0, 1)])]},
@@ -57,59 +62,53 @@ def test_reproject_polygon():
     out = reproject_polygon(gdf, "EPSG:5070")
     assert out.crs.to_string() == "EPSG:5070"
 
-def test_resample_raster():
+
+def test_resample_raster_xr():
     """
-    Test raster resampling to different resolution.
+    Resample a raster DataArray to a finer resolution in the same CRS.
 
-    Inputs
-    ------
-    array : 2x2 numpy array
-    profile : rasterio profile with 1x1 pixel size
-    target_resolution : float
+    Setup
+    -----
+    - Build a 2x2 DataArray with EPSG:5070 and 1x1 pixel size.
+      Upper-left origin at (0, 2) → transform from_origin(0, 2, 1, 1).
 
-    Expected Output
-    ---------------
-    A resampled array with new dimensions determined by scale factor.
+    Expected
+    --------
+    - Output transform’s pixel width (a) equals 0.5.
+    - Output shape doubles in both dimensions (from 2x2 to 4x4).
     """
-    array = np.array([[1, 2], [3, 4]], dtype=float)
-    transform = from_origin(0, 2, 1, 1)
+    arr = np.array([[1, 2], [3, 4]], dtype="float32")
+    T = from_origin(0.0, 2.0, 1.0, 1.0)
 
-    profile = {
-        "crs": "EPSG:5070",
-        "transform": transform,
-        "width": 2,
-        "height": 2,
-        "count": 1,
-    }
+    da = xr.DataArray(arr, dims=("y", "x"), name="band1")
+    da = da.rio.write_crs("EPSG:5070").rio.write_transform(T)
 
-    array_out, profile_out = resample_raster(array, profile, target_resolution=0.5)
+    da_out = resample_raster_xr(da, target_resolution=0.5)
+    T_out = da_out.rio.transform()
 
-    assert profile_out["transform"].a == 0.5
-    assert array_out.shape == (4, 4)
+    assert T_out.a == 0.5
+    assert da_out.sizes["y"] == 4
+    assert da_out.sizes["x"] == 4
+    assert da_out.rio.crs.to_string() == "EPSG:5070"
 
-def test_reproject_raster():
+
+def test_reproject_raster_xr():
     """
-    Smoke test for raster reprojection.
+    Smoke test for raster reprojection from EPSG:4326 to EPSG:5070.
 
     Notes
     -----
-    We do not check exact numeric values because the transformation
-    between EPSG:4326 and EPSG:5070 introduces nontrivial distortions.
-    Instead, we verify:
-    - The output CRS is correct
-    - The output array is non-empty
+    We avoid asserting exact numeric values since reprojection introduces distortions.
+    We only validate:
+    - The output CRS is EPSG:5070.
+    - The output array has nonzero size.
     """
-    array = np.array([[1, 2], [3, 4]], dtype=float)
-    transform = from_origin(-90, 45, 1, 1)
+    arr = np.array([[1, 2], [3, 4]], dtype="float32")
+    # Synthetic georeferencing: upper-left (-90, 45), pixel size 1x1 degrees
+    T = from_origin(-90.0, 45.0, 1.0, 1.0)
 
-    profile = {
-        "crs": "EPSG:4326",
-        "transform": transform,
-        "width": 2,
-        "height": 2,
-        "count": 1,
-    }
+    da = xr.DataArray(arr, dims=("y", "x"), name="band1")
+    da = da.rio.write_crs("EPSG:4326").rio.write_transform(T)
 
-    array_out, profile_out = reproject_raster(array, profile, "EPSG:5070")
-    assert str(profile_out["crs"]) == "EPSG:5070"
-    assert array_out.size > 0
+    da_out = reproject_raster_xr(da, "EPSG:5070")
+    assert da_out.rio.crs.to_string() == "EPSG:5070"
