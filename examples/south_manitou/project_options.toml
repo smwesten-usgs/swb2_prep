@@ -1,0 +1,77 @@
+# ================================================================
+# Project-wide configuration for swb2_prep CLIs
+# ================================================================
+
+[project]
+# The CRS all rasters and AOI polygons will be reprojected into.
+# Use any valid PROJ string or EPSG code.
+crs = "EPSG:5070"
+
+# Grid cell size, expressed in project CRS units.
+resolution = 30.0
+
+# Units used for naming output files (e.g., "m", "ft")
+# These describe the resolution units.
+units = "m"
+
+# ================================================================
+# Input and Output Paths
+# ================================================================
+
+[paths]
+# Directory containing your raw input rasters and shapefiles.
+# This can be absolute or relative.
+input_dir = "data"
+
+# Directory where processed rasters (GeoTIFF + ArcASCII) will be saved.
+output_dir = "output"
+
+# ================================================================
+# AOI Selection
+# ================================================================
+# The CLI allows AOI selection in two ways:
+#   1. Polygon shapefile
+#   2. Bounding box (xmin, ymin, xmax, ymax)
+#
+# Only one mode is used per run, but config provides defaults.
+
+[aoi]
+# Full path to the AOI polygon file (ESRI Shapefile required)
+polygon = "data/aoi.shp"
+
+# Optional: attribute field + value to select exactly one polygon
+# Leave both empty if shapefile contains only one polygon.
+polygon_name = ""
+polygon_value = ""
+
+# Alternatively:
+# bbox = [xmin, ymin, xmax, ymax]
+
+# ================================================================
+# Landuse Raster
+# ================================================================
+[landuse]
+# Path to the raw landuse raster.
+raster = "data/cdl__south_manitou.tif"
+
+# ================================================================
+# Soil Inputs (Optional sections for other CLIs)
+# ================================================================
+[awc]
+raster = "data/awc_raw.tif"
+
+[hsg]
+raster = "data/hsg_raw.tif"
+
+# ================================================================
+# D8 Flow Direction (Optional)
+# ================================================================
+[d8]
+raster = "data/dem_filled.tif"
+
+# ================================================================
+# Weather / Other Future Datasets
+# ================================================================
+[weather]
+precip = ""
+temp = ""
