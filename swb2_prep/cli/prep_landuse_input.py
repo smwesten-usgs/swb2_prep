@@ -19,6 +19,7 @@ Design:
 - XR-first functions from swb2_prep/common (rioxarray + rasterio under the hood)
 """
 
+import gc
 import argparse
 from pathlib import Path
 import geopandas as gpd
@@ -43,7 +44,6 @@ from swb2_prep.common.paths import (
     ensure_dir,
     build_output_filename,
 )
-
 
 def parse_args() -> argparse.Namespace:
     """
@@ -309,11 +309,12 @@ def main() -> None:
     # proj4 string (robust via pyproj)
     try:
         proj4 = _CRS.from_user_input(da.rio.crs).to_proj4()
-    except Exception:
+    except:
         proj4 = str(da.rio.crs)
-
     print(nx, ny, llx, lly, project_resolution, proj4)
-
+    
+    del da
+    gc.collect()
 
 if __name__ == "__main__":
     main()
