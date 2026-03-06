@@ -24,6 +24,7 @@ import argparse
 from pathlib import Path
 import geopandas as gpd
 from pyproj import CRS as _CRS
+from rasterio.enums import Resampling
 
 from swb2_prep.common.config import load_project_options
 from swb2_prep.common.grids import (
@@ -259,8 +260,7 @@ def main() -> None:
         da = reproject_raster_xr(da, project_crs, resolution=project_resolution)
     else:
         xres = float(da.rio.transform().a)
-        if abs(xres - project_resolution) > 1e-6:
-            da = resample_raster_xr(da, target_resolution=project_resolution)
+        da = resample_raster_xr(da, target_resolution=project_resolution)
 
     # 6. Clip raster to AOI polygon (auto-reprojects AOI if CRSs differ)
     da = clip_raster_to_polygon_xr(da, aoi_gdf)

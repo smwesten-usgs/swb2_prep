@@ -95,6 +95,8 @@ def resample_raster_xr(
         Desired pixel size in CRS units (e.g., meters for EPSG:5070).
     resampling : rasterio.warp.Resampling, optional
         Resampling method (default: bilinear).
+        Other methods include 'nearest', 'bilinear', 'cubic', 'cubic_spline',
+           'lanczos', 'average', 'mode'
 
     Returns
     -------

@@ -37,6 +37,7 @@ swb2-prep-awc = "swb2_prep.cli.prep_awc_input:main"
 swb2-prep-hsg = "swb2_prep.cli.prep_hsg_input:main"
 swb2-prep-d8 = "swb2_prep.cli.prep_d8_flowdir:main"
 swb2-prep-control = "swb2_prep.cli.make_swb_control_file:main"
+swb2-prep-grid = "swb2_prep.cli.define_swb_grid:main"
 
 [tool.setuptools.packages.find]
 # Include the main package and all subpackages
