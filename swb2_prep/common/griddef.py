@@ -19,6 +19,9 @@ from __future__ import annotations
 from pathlib import Path
 import tomllib  # Python 3.11+ TOML reader
 import toml     # External, full-feature TOML writer
+import geopandas as gpd
+from shapely.geometry import box
+from pyproj import CRS as _CRS
 
 
 REQUIRED_FIELDS = [
@@ -31,6 +34,36 @@ REQUIRED_FIELDS = [
     "snap",
     "source",
 ]
+
+
+def griddef_to_polygon_gdf(grid: dict) -> gpd.GeoDataFrame:
+    """
+    Create a GeoDataFrame containing a single polygon representing
+    the bounding box of the SWB grid.
+
+    Parameters
+    ----------
+    grid : dict
+        Parsed grid-definition dictionary, as returned by
+        read_grid_definition().
+
+    Returns
+    -------
+    geopandas.GeoDataFrame
+        Single-row GeoDataFrame containing the bounding-box polygon
+        in the correct CRS.
+    """
+    xmin = grid["xmin"]
+    ymin = grid["ymin"]
+    xmax = grid["xmax"]
+    ymax = grid["ymax"]
+
+    geom = box(xmin, ymin, xmax, ymax)
+
+    # Ensure CRS is a valid CRS object/string
+    crs = _CRS.from_user_input(grid["crs"]).to_string()
+
+    return gpd.GeoDataFrame({"geometry": [geom]}, crs=crs)
 
 
 def write_grid_definition(path: Path, grid: dict) -> None:

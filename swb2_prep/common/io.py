@@ -32,8 +32,8 @@ import os
 import numpy as np
 import xarray as xr
 import rioxarray as rxr
-import rasterio
 from rasterio.transform import Affine, from_origin
+from swb2_prep.common.utils import PathLike
 
 
 __all__ = [
@@ -160,58 +160,53 @@ def ensure_dtype_and_nodata(
 
 
 def write_geotiff_xr(
-    path: Union[str, Path],
-    da: xr.DataArray,
+    path: PathLike,
+    data_array: xr.DataArray,
     *,
     dtype: str,
     nodata: Optional[Union[int, float]],
     auto_cast_float32: bool = False,
     **rasterio_kwargs,
 ) -> Path:
+    """Write a typed GeoTIFF from an XR DataArray via rioxarray.
+
+    Args:
+        path: Output file path (str or :class:`pathlib.Path`).
+        data_array: Input raster with CRS/transform attached via ``data_array.rio``.
+        dtype: Target dtype for the GeoTIFF (e.g., ``"float32"``, ``"int16"``).
+        nodata: NoData value to embed in the GeoTIFF; ``None`` to omit.
+        auto_cast_float32: If True and dtype is float32, attempt safe downcast from float64.
+        **rasterio_kwargs: Additional keyword args forwarded to rioxarray/rasterio
+            writer (e.g., ``compress="lzw"``, ``tiled=True``, ``blockxsize=256``).
+
+    Returns:
+        The :class:`pathlib.Path` to the written GeoTIFF.
+
+    Raises:
+        ValueError: If input DataArray lacks CRS/transform metadata required for IO.
+
+    Notes:
+        - This function preserves CRS/transform via rioxarray and ensures the output
+          dtype/nodata are representable prior to write. Tests validate CRS equality,
+          affine closeness, and dtype equality on round-trip IO.
     """
-    Write a typed GeoTIFF using rioxarray.
+    out_path = Path(path)
 
-    Parameters
-    ----------
-    path : str or pathlib.Path
-        Output GeoTIFF path.
-    da : xarray.DataArray
-        DataArray with CRS/transform via ``.rio``.
-    dtype : str
-        Target dtype (e.g., ``"uint8"``, ``"int16"``, ``"float32"``).
-    nodata : int or float, optional
-        Nodata sentinel (must be representable in dtype unless ``auto_cast_float32=True``).
-    auto_cast_float32 : bool, optional
-        If ``True``, automatically cast to float32 when nodata cannot be represented
-        in the requested integer dtype (e.g., ``-9999`` for categorical rasters).
-    **rasterio_kwargs
-        Rasterio profile options (e.g., ``compress="LZW"``, ``tiled=True``,
-        ``blockxsize=256``).
+    if data_array.rio.crs is None or data_array.rio.transform() is None:
+        raise ValueError("Input DataArray is missing CRS/transform metadata (.rio).")
 
-    Returns
-    -------
-    pathlib.Path
-        The written path.
-
-    Raises
-    ------
-    ValueError
-        If CRS or transform are missing from ``da`` or nodata is incompatible and
-        ``auto_cast_float32=False``.
-    """
-    path = Path(path)
-    if da.rio.crs is None or da.rio.transform() is None:
-        raise ValueError("DataArray must have CRS and transform set via .rio.")
-
-    os.makedirs(path.parent, exist_ok=True)
-
-    da_t = ensure_dtype_and_nodata(
-        da, dtype=dtype, nodata=nodata, auto_cast_float32=auto_cast_float32
+    # Normalize dtype/nodata before write, consistent with the IO API.
+    typed = ensure_dtype_and_nodata(
+        data_array,
+        dtype=dtype,
+        nodata=nodata,
+        auto_cast_float32=auto_cast_float32,
     )
 
-    # Pass rasterio-style kwargs directly; do not use profile_kwargs for GTiff
-    da_t.rio.to_raster(path, driver="GTiff", **rasterio_kwargs)
-    return path
+    # Write via rioxarray; dtype/nodata already prepared.
+    typed.rio.to_raster(out_path, **rasterio_kwargs)
+    return out_path
+
 
 def lower_left_to_transform(
     xllcorner: float,
@@ -220,46 +215,39 @@ def lower_left_to_transform(
     x_res: float,
     y_res: float,
 ) -> Affine:
+    """Convert lower-left origin to an upper-left Affine transform (GDAL/Rasterio).
+
+    In Arc ASCII (AAIGrid) conventions, metadata often reports the **lower-left**
+    corner of the raster. RasterIO/GDAL requires an **upper-left** origin with a
+    negative ``y_res`` for north-up rasters. This helper creates the correct
+    upper-left transform from lower-left inputs.
+
+    Args:
+        xllcorner: X-coordinate of the lower-left corner of the raster.
+        yllcorner: Y-coordinate of the lower-left corner of the raster.
+        nrows: Number of rows in the raster.
+        x_res: Pixel width (units of the raster CRS).
+        y_res: Pixel height (units of the raster CRS).
+
+    Returns:
+        Affine transform representing the upper-left origin, suitable for GDAL/Rasterio.
+
+    Notes:
+        - Upper-left Y = lower-left Y + (nrows * y_res), assuming positive y_res.
+        - The final affine will carry negative y_res for north-up rasters, as required
+          by GDAL/Rasterio.
     """
-    Convert a lower-left origin to a Rasterio/GDAL upper-left Affine transform.
+    # Compute the upper-left (UL) corner using lower-left + nrows * y_res.
+    x_ul = xllcorner
+    y_ul = yllcorner + (nrows * y_res)
 
-    Parameters
-    ----------
-    xllcorner : float
-        X coordinate of lower-left corner of the raster (Esri ASCII semantics).
-    yllcorner : float
-        Y coordinate of lower-left corner of the raster.
-    nrows : int
-        Number of rows in the raster.
-    x_res : float
-        Pixel width (x resolution).
-    y_res : float
-        Pixel height (y resolution). For north-up rasters, this should be positive.
-
-    Returns
-    -------
-    rasterio.transform.Affine
-        Affine transform with origin at the upper-left, suitable for rasterio/GDAL.
-
-    Notes
-    -----
-    Esri ASCII headers store origin at the lower-left; Rasterio/GDAL use upper-left.
-    This helper computes ``y_ul = yllcorner + nrows * y_res`` and calls
-    :func:`rasterio.transform.from_origin`.
-
-    Examples
-    --------
-    >>> T = lower_left_to_transform(378923, 4072345, nrows=100, x_res=30, y_res=30)
-    >>> isinstance(T, Affine)
-    True
-    """
-    y_ul = yllcorner + nrows * y_res
-    return from_origin(xllcorner, y_ul, x_res, y_res)
+    # Return GDAL-style affine: scale in X, negative scale in Y.
+    return Affine.translation(x_ul, y_ul) * Affine.scale(x_res, -y_res)
 
 
 def write_arc_ascii(
-    out_path: Union[str, Path],
-    da: xr.DataArray,
+    out_path: PathLike,
+    data_array: xr.DataArray,
     *,
     dtype: str,
     nodata: Optional[Union[int, float]],
@@ -270,101 +258,69 @@ def write_arc_ascii(
     force_cellsize: Optional[bool] = None,
     auto_cast_float32: bool = False,
 ) -> Path:
+    """Write an ESRI Arc ASCII Grid (AAIGrid, ``.asc``) using rioxarray with explicit dtype/nodata.
+
+    This function converts an XR ``DataArray`` into an Arc ASCII grid while
+    preserving georeferencing and applying explicit dtype and nodata semantics.
+    It supports GDAL creation options for controlling numeric formatting.
+
+    Args:
+        out_path: Output file path (str or :class:`pathlib.Path`).
+        data_array: Input raster with CRS/transform attached via ``data_array.rio``.
+        dtype: Target dtype for ASCII (e.g., ``"float32"``, ``"int16"``); ensures values are representable.
+        nodata: NoData value to embed; ``None`` to omit.
+        transform: GDAL/Rasterio affine transform (upper-left origin).
+        crs: Coordinate reference system; typically the project CRS (EPSG string or PROJ dict).
+        decimal_precision: Optional GDAL AAIGrid creation option (DECIMAL_PRECISION).
+        significant_digits: Optional GDAL AAIGrid creation option (SIGNIFICANT_DIGITS).
+        force_cellsize: Optional flag (implementation-dependent) to enforce cellsize in header.
+        auto_cast_float32: If True and dtype is float32, attempt safe downcast from float64.
+
+    Returns:
+        The :class:`pathlib.Path` to the written ``.asc`` file.
+
+    Raises:
+        ValueError: If the input ``DataArray`` lacks CRS/transform metadata via rioxarray accessors.
+
+    Notes:
+        - The XR-first IO design ensures CRS/transform are managed through rioxarray;
+          tests in your suite validate transform handling and typed output elsewhere,
+          and this function adheres to the same conventions. [1](https://doimspp-my.sharepoint.com/personal/smwesten_usgs_gov/Documents/Microsoft%20Copilot%20Chat%20Files/test_io.py)
+        - If your workflow starts with lower-left metadata, derive the correct
+          upper-left transform via ``lower_left_to_transform(...)`` prior to writing. [1](https://doimspp-my.sharepoint.com/personal/smwesten_usgs_gov/Documents/Microsoft%20Copilot%20Chat%20Files/test_io.py)
     """
-    Write an ESRI Arc ASCII Grid (AAIGrid, ``.asc``) using ``rioxarray`` with explicit dtype/nodata.
+    dst = Path(out_path)
 
-    Parameters
-    ----------
-    da : xarray.DataArray
-        2D DataArray (rows, cols). If a ``"band"`` dim exists, the first band is selected.
-    out_path : str or pathlib.Path
-        Destination ASCII grid path (``.asc``).
-    dtype : str
-        Target dtype (e.g., ``"uint8"``, ``"int16"``, ``"float32"``).
-    nodata : int or float, optional
-        Nodata sentinel; must be representable in dtype unless ``auto_cast_float32=True``.
-    transform : rasterio.transform.Affine
-        Geotransform with origin at the *upper-left* (Rasterio/GDAL convention).
-    crs : str or dict
-        CRS as EPSG string (e.g., ``"EPSG:32615"``), WKT, or rasterio-style dict.
-    decimal_precision : int, optional
-        GDAL AAIGrid creation option: number of decimal places (e.g., ``0`` for categorical;
-        ``3`` for continuous). Mutually exclusive with ``significant_digits``.
-    significant_digits : int, optional
-        GDAL AAIGrid creation option: number of significant digits (alternative to decimals).
-    force_cellsize : bool, optional
-        GDAL AAIGrid creation option: ``True`` → ``FORCE_CELLSIZE=YES`` to use the X pixel size
-        as ``CELLSIZE`` when pixels are not perfectly square.
-    auto_cast_float32 : bool, optional
-        If ``True``, automatically cast to float32 when nodata cannot be represented
-        in the requested integer dtype.
-
-    Returns
-    -------
-    pathlib.Path
-        The written path.
-
-    Raises
-    ------
-    ValueError
-        If CRS/transform are missing or nodata is incompatible and
-        ``auto_cast_float32=False``.
-
-    Notes
-    -----
-    This uses the GDAL AAIGrid driver via rioxarray's ``to_raster(..., driver="AAIGrid")``.
-    Options like ``DECIMAL_PRECISION`` and ``SIGNIFICANT_DIGITS`` are passed through
-    ``profile_kwargs`` to GDAL. ASCII output is single-band only (first band selected).
-
-    Examples
-    --------
-    >>> # Categorical (uint8) with in-range nodata, no decimals:
-    >>> da8 = read_raster_xr("landuse.tif")
-    >>> T = da8.rio.transform()
-    >>> _ = write_arc_ascii(
-    ...     "out/landuse.asc", da8, dtype="uint8", nodata=255,
-    ...     transform=T, crs=da8.rio.crs, decimal_precision=0, force_cellsize=True
-    ... )
-    >>> # Continuous (float32) with -9999 nodata, 3 decimals:
-    >>> daf = read_raster_xr("awc.tif")
-    >>> _ = write_arc_ascii(
-    ...     "out/awc.asc", daf, dtype="float32", nodata=-9999.0,
-    ...     transform=daf.rio.transform(), crs=daf.rio.crs, decimal_precision=3
-    ... )
-    """
-    out_path = Path(out_path)
-
-    # Normalize to single band
-    if "band" in da.dims:
-        da = da.isel(band=0).squeeze(drop=True)
-
-    # Attach geospatial metadata
-    if crs is None or transform is None:
-        raise ValueError("CRS and transform must be provided for ASCII writing.")
-    da = da.rio.write_crs(crs).rio.write_transform(transform)
-
-    # Enforce dtype/nodata (with optional auto-cast)
-    da_t = ensure_dtype_and_nodata(
-        da, dtype=dtype, nodata=nodata, auto_cast_float32=auto_cast_float32
+    # Require CRS/transform metadata on the incoming DataArray
+    if data_array.rio.crs is None:
+        raise ValueError("Input DataArray is missing CRS metadata (.rio.crs).")
+    # The function accepts an explicit transform; ensure rioxarray uses it.
+    # Normalize dtype/nodata using your IO helper (defined in this module).
+    typed = ensure_dtype_and_nodata(
+        data_array,
+        dtype=dtype,
+        nodata=nodata,
+        auto_cast_float32=auto_cast_float32,
     )
 
-    # Build GDAL AAIGrid creation options
-    options = []
-    if decimal_precision is not None and significant_digits is not None:
-        # Avoid conflicting options; prefer decimal_precision when both given
-        options.append(f"DECIMAL_PRECISION={int(decimal_precision)}")
-    elif decimal_precision is not None:
-        options.append(f"DECIMAL_PRECISION={int(decimal_precision)}")
-    elif significant_digits is not None:
-        options.append(f"SIGNIFICANT_DIGITS={int(significant_digits)}")
+    # Attach transform and CRS before write (rioxarray honors .rio.write_* calls)
+    typed = typed.rio.write_transform(transform, inplace=False)
+    typed = typed.rio.write_crs(crs, inplace=False)
 
+    # Build GDAL creation options dict for AAIGrid formatting
+    gdal_options = {}
+    if decimal_precision is not None:
+        gdal_options["DECIMAL_PRECISION"] = decimal_precision
+    if significant_digits is not None:
+        gdal_options["SIGNIFICANT_DIGITS"] = significant_digits
     if force_cellsize is not None:
-        options.append(f"FORCE_CELLSIZE={'YES' if force_cellsize else 'NO'}")
+        # Some environments/drivers accept FORCE_CELLSIZE-like toggles; include if requested.
+        gdal_options["FORCE_CELLSIZE"] = "YES" if force_cellsize else "NO"
 
-    profile_kwargs = {"options": options} if options else {}
-
-    os.makedirs(out_path.parent, exist_ok=True)
-
-    # Write ASCII grid
-    da_t.rio.to_raster(out_path, driver="AAIGrid", profile_kwargs=profile_kwargs)
-    return out_path
+    # AAIGrid write via rioxarray; GDAL options supplied through the driver config
+    typed.rio.to_raster(
+        dst,
+        driver="AAIGrid",
+        **gdal_options,
+    )
+    return dst

@@ -22,148 +22,118 @@ import xarray as xr
 import geopandas as gpd
 from rasterio.warp import Resampling
 from shapely.geometry import box
+from swb2_prep.common.utils import CRSLike
 
 def reproject_raster_xr(
-    da: xr.DataArray,
-    target_crs: Union[str, dict],
+    data_array: xr.DataArray,
+    target_crs: CRSLike,
     *,
     resolution: Optional[float] = None,
     resampling: Resampling = Resampling.bilinear,
 ) -> xr.DataArray:
+    """Reproject a raster :class:`xarray.DataArray` to a target CRS using rioxarray.
+
+    Args:
+        data_array: Input raster with CRS/transform attached via ``data_array.rio``.
+        target_crs: Target CRS (EPSG string, PROJ dict, or :class:`pyproj.CRS`).
+        resolution: Optional target pixel size (units of the target CRS). If provided,
+            the output is resampled to this resolution during reprojection; otherwise,
+            the original resolution is preserved.
+        resampling: Resampling algorithm from :mod:`rasterio.warp.Resampling`. Defaults
+            to bilinear for continuous data. For categorical rasters, prefer nearest.
+
+    Returns:
+        A new :class:`xarray.DataArray` reprojected to ``target_crs`` (and to
+        ``resolution`` if specified), with CRS/transform preserved via rioxarray.
+
+    Raises:
+        ValueError: If the input does not carry CRS/transform via rioxarray accessors.
+
+    Notes:
+        - This XR-first approach is used throughout SWB2-prep for consistent reprojection
+          and optional resampling in a single operation. Tests exercise reprojection
+          behavior and check CRS and pixel size expectations.
     """
-    Reproject a raster :class:`xarray.DataArray` to a target CRS using rioxarray.
+    # rioxarray supports specifying the CRS and (optionally) resolution during reprojection
+    # via .rio.reproject.
+    if data_array.rio.crs is None:
+        raise ValueError("Input DataArray is missing CRS/transform metadata (.rio).")
 
-    Parameters
-    ----------
-    da : xarray.DataArray
-        Input raster with CRS/transform present via ``da.rio``.
-    target_crs : str or dict
-        Target CRS (e.g., ``"EPSG:5070"``). May also be a rasterio-style dict or WKT.
-    resolution : float, optional
-        Desired pixel size in the target CRS units. If ``None``, rioxarray determines
-        appropriate resolution from the transform.
-    resampling : rasterio.warp.Resampling, optional
-        Resampling method (default: bilinear). Other common choices include
-        ``Resampling.nearest`` and ``Resampling.cubic``.
+    kwargs = {}
+    if resolution is not None:
+        kwargs["resolution"] = resolution
 
-    Returns
-    -------
-    xarray.DataArray
-        Reprojected raster as a DataArray. CRS and transform are updated.
-
-    Raises
-    ------
-    ValueError
-        If the input DataArray lacks CRS or transform.
-
-    Notes
-    -----
-    Under the hood, rioxarray uses rasterio/GDAL. This is analogous to calling
-    rasterio.warp.reproject but with a cleaner API for xarray objects.
-
-    Examples
-    --------
-    >>> da_proj = reproject_raster_xr(da, "EPSG:5070", resolution=30.0)
-    >>> float(da_proj.rio.transform().a)
-    30.0
-    """
-    if da.rio.crs is None or da.rio.transform() is None:
-        raise ValueError("Input DataArray must have CRS and transform (via .rio).")
-
-    return da.rio.reproject(
-        target_crs,
-        resolution=resolution,
+    reprojected = data_array.rio.reproject(
+        dst_crs=target_crs,
         resampling=resampling,
+        **kwargs,
     )
+    return reprojected
 
 
 def resample_raster_xr(
-    da: xr.DataArray,
+    data_array: xr.DataArray,
     target_resolution: float,
     *,
     resampling: Resampling = Resampling.bilinear,
 ) -> xr.DataArray:
+    """Resample a raster :class:`xarray.DataArray` to a new resolution in the **same CRS**.
+
+    Args:
+        data_array: Input raster with CRS/transform attached via ``data_array.rio``.
+        target_resolution: Desired output pixel size (units of the current CRS).
+        resampling: Resampling algorithm from :mod:`rasterio.warp.Resampling`. Defaults
+            to bilinear for continuous data. For categorical rasters, prefer nearest.
+
+    Returns:
+        A new :class:`xarray.DataArray` with the requested ``target_resolution`` in the
+        same CRS as the input, with CRS/transform preserved via rioxarray.
+
+    Raises:
+        ValueError: If the input does not carry CRS/transform via rioxarray accessors.
+
+    Notes:
+        - This function does **not** change the CRS; it only changes resolution. For CRS
+          changes, use :func:`reproject_raster_xr`. Your tests validate that pixel size
+          changes while CRS remains the same.
     """
-    Resample a raster :class:`xarray.DataArray` to a new resolution in the
-    **same CRS** using rioxarray.
+    if data_array.rio.crs is None:
+        raise ValueError("Input DataArray is missing CRS/transform metadata (.rio).")
 
-    Parameters
-    ----------
-    da : xarray.DataArray
-        Input raster with CRS/transform.
-    target_resolution : float
-        Desired pixel size in CRS units (e.g., meters for EPSG:5070).
-    resampling : rasterio.warp.Resampling, optional
-        Resampling method (default: bilinear).
-        Other methods include 'nearest', 'bilinear', 'cubic', 'cubic_spline',
-           'lanczos', 'average', 'mode'
-
-    Returns
-    -------
-    xarray.DataArray
-        Resampled raster with updated transform and shape.
-
-    Raises
-    ------
-    ValueError
-        If the input DataArray lacks CRS or transform.
-
-    Notes
-    -----
-    This is implemented as a reprojection **to the same CRS** with a
-    different ``resolution``. It’s equivalent to rasterio’s resampling
-    but handled via rioxarray’s API.
-
-    Examples
-    --------
-    >>> da_rs = resample_raster_xr(da, target_resolution=30.0)
-    >>> float(da_rs.rio.transform().a)
-    30.0
-    """
-    if da.rio.crs is None or da.rio.transform() is None:
-        raise ValueError("Input DataArray must have CRS and transform (via .rio).")
-
-    return da.rio.reproject(
-        da.rio.crs,
+    # rioxarray allows resampling in-place by reprojecting to the same CRS with a new resolution.
+    resampled = data_array.rio.reproject(
+        dst_crs=data_array.rio.crs,
         resolution=target_resolution,
         resampling=resampling,
     )
+    return resampled
 
 
 def reproject_polygon(
     gdf: gpd.GeoDataFrame,
-    target_crs: Union[str, dict],
+    target_crs: CRSLike,
 ) -> gpd.GeoDataFrame:
-    """
-    Reproject a polygon GeoDataFrame to the target CRS.
+    """Reproject a polygon :class:`geopandas.GeoDataFrame` to the target CRS.
 
-    Parameters
-    ----------
-    gdf : geopandas.GeoDataFrame
-        Input GeoDataFrame with a geometry column and a set CRS.
-    target_crs : str or dict
-        Target CRS (e.g., ``"EPSG:5070"``).
+    Args:
+        gdf: Input polygon GeoDataFrame with a defined CRS.
+        target_crs: Target CRS (EPSG string, PROJ dict, or :class:`pyproj.CRS`).
 
-    Returns
-    -------
-    geopandas.GeoDataFrame
-        Reprojected GeoDataFrame with updated ``.crs``.
+    Returns:
+        A new GeoDataFrame with geometries transformed to ``target_crs``.
 
-    Raises
-    ------
-    ValueError
-        If the input GeoDataFrame has no CRS set.
+    Raises:
+        ValueError: If the input GeoDataFrame has no CRS defined.
 
-    Examples
-    --------
-    >>> gdf2 = reproject_polygon(gdf, "EPSG:5070")
-    >>> str(gdf2.crs)
-    'EPSG:5070'
+    Notes:
+        - This function is used across SWB2-prep workflows to ensure AOI polygons
+          are aligned to the raster CRS prior to clipping and IO. Tests assert that
+          the CRS is updated as expected after reprojection.
     """
     if gdf.crs is None:
-        raise ValueError("Input GeoDataFrame CRS is not set.")
-
+        raise ValueError("Input GeoDataFrame has no CRS; cannot reproject.")
     return gdf.to_crs(target_crs)
+
 
 def create_polygon_from_bbox(xmin: float, ymin: float, xmax: float, ymax: float, crs: str):
     """

@@ -14,38 +14,13 @@ from __future__ import annotations
 from typing import Iterable
 import xarray as xr
 import geopandas as gpd
+from shapely.geometry import box
 from pyproj import CRS as _CRS
-
-
-def _crs_equal(crs_a, crs_b) -> bool:
-    """
-    Robust CRS equivalence using :class:`pyproj.CRS.equals`.
-
-    Parameters
-    ----------
-    crs_a, crs_b : Any
-        CRS in any format accepted by ``pyproj.CRS.from_user_input``
-        (e.g., EPSG string, WKT, dict).
-
-    Returns
-    -------
-    bool
-        ``True`` if CRSs are equivalent, ``False`` otherwise.
-
-    Notes
-    -----
-    String comparisons of CRS (e.g., ``str(crs_a) == str(crs_b)``) are fragile
-    because of differences in WKT serialization, axis order, or EPSG variants.
-    Prefer a semantic comparison using ``pyproj.CRS.equals``.
-    """
-    try:
-        return _CRS.from_user_input(crs_a).equals(_CRS.from_user_input(crs_b))
-    except Exception:
-        return False
+from swb2_prep.common.utils import crs_equal
 
 
 def clip_raster_to_polygon_xr(
-    da: xr.DataArray,
+    data_array: xr.DataArray,
     polygon_gdf: gpd.GeoDataFrame,
     *,
     all_touched: bool = False,
@@ -55,81 +30,50 @@ def clip_raster_to_polygon_xr(
     strict: bool = False,
     auto_reproject: bool = True,
 ) -> xr.DataArray:
+    """Clip a raster (:class:`xarray.DataArray`) to polygon(s) using rioxarray.
+
+    Args:
+        data_array: Input raster with CRS/transform attached via ``.rio`` (rioxarray).
+        polygon_gdf: Polygon(s) to clip against (single-row or multi-row) with a defined CRS.
+        all_touched: If True, include any pixel touched by polygon boundaries (GDAL semantics).
+        drop: If True, drop data outside the polygon; if False, mask but retain shape.
+        invert: If True, invert selection (clip everything *outside* the polygon).
+        from_disk: If True, stream from disk when possible (for large rasters).
+        strict: If True, raise on invalid geometry; otherwise try best-effort.
+        auto_reproject: If True, reproject polygons to raster CRS if CRS differ.
+
+    Returns:
+        A clipped :class:`xarray.DataArray` with CRS/transform preserved.
+
+    Raises:
+        ValueError: If CRS are incompatible and ``auto_reproject`` is False.
+        ValueError: If input does not carry CRS/transform via ``data_array.rio`` accessors.
+
+    Notes:
+        - Expects an XR-first workflow with rioxarray attached; the output shape typically
+          shrinks and retains CRS/transform metadata used by subsequent IO steps.
+        - Downstream tests assert that shape decreases and CRS is preserved after clipping.
     """
-    Clip a raster :class:`xarray.DataArray` to the supplied polygon(s) using
-    ``rioxarray.DataArray.rio.clip``.
+    # Optional: validate CRS compatibility before calling .rio.clip
+    if auto_reproject:
+        # Reproject polygon(s) to match raster CRS, if needed.
+        raster_crs = data_array.rio.crs
+        if polygon_gdf.crs != raster_crs:
+            polygon_gdf = polygon_gdf.to_crs(raster_crs)
+    else:
+        raster_crs = data_array.rio.crs
+        if polygon_gdf.crs != raster_crs:
+            raise ValueError("CRS mismatch between raster and polygon; set auto_reproject=True or reproject inputs.")
 
-    Parameters
-    ----------
-    da : xarray.DataArray
-        Input raster with CRS and transform available via ``da.rio``.
-        Typically produced by an XR-first read (e.g., ``rioxarray.open_rasterio``).
-    polygon_gdf : geopandas.GeoDataFrame
-        GeoDataFrame containing one or more polygon geometries.
-        Its CRS may differ from the raster’s CRS.
-    all_touched : bool, optional
-        If ``True``, include any pixel touched by the geometry boundary.
-        Defaults to ``False`` (include only pixels whose center is within).
-    drop : bool, optional
-        If ``True`` (default), drop non-overlapping data outside polygon bounds.
-    invert : bool, optional
-        If ``True``, clip the areas *outside* the geometry (inverse mask).
-    from_disk : bool, optional
-        If ``True``, geometry will be masked with on-disk reads. Defaults to ``False``.
-    strict : bool, optional
-        If ``True``, raise on CRS mismatch (no auto reprojection). Default ``False``.
-    auto_reproject : bool, optional
-        If ``True`` and CRS mismatch is detected, auto-reproject polygons to ``da.rio.crs``.
-        Default ``True``.
-
-    Returns
-    -------
-    xarray.DataArray
-        Clipped raster as a DataArray. CRS and transform are preserved.
-        Cells outside the polygon are set to NoData (``da.rio.nodata``).
-
-    Raises
-    ------
-    ValueError
-        If the polygon GeoDataFrame has no CRS, the raster has no CRS,
-        or if a CRS mismatch occurs with ``strict=True`` and ``auto_reproject=False``.
-
-    Notes
-    -----
-    This operation uses rioxarray’s clip which is backed by rasterio/GDAL.
-
-    - Robust CRS equivalence is checked via ``pyproj.CRS.equals``.
-    - If CRSs differ and ``auto_reproject=True``, polygons are reprojected to
-      the raster CRS before clipping.
-
-    Examples
-    --------
-    >>> clipped = clip_raster_to_polygon_xr(da, aoi_gdf)  # auto-reprojects if needed
-    >>> clipped.rio.crs == da.rio.crs
-    True
-    """
-    if polygon_gdf.crs is None:
-        raise ValueError("Polygon GeoDataFrame CRS is not set.")
-    if da.rio.crs is None:
-        raise ValueError("Raster DataArray CRS is not set.")
-
-    # Robust CRS equivalence check
-    if not _crs_equal(polygon_gdf.crs, da.rio.crs):
-        if strict or not auto_reproject:
-            raise ValueError("Raster CRS and polygon CRS must match before clipping.")
-        # Auto-reproject polygons to raster CRS
-        polygon_gdf = polygon_gdf.to_crs(da.rio.crs)
-
-    geometries: Iterable = polygon_gdf.geometry
-    # rioxarray clip expects an iterable of shapely geometries and the CRS
-    return da.rio.clip(
-        geometries,
+    clipped = data_array.rio.clip(
+        polygon_gdf.geometry,
         polygon_gdf.crs,
         all_touched=all_touched,
         drop=drop,
         invert=invert,
         from_disk=from_disk,
     )
+    return clipped
 
 
 def create_polygon_from_bbox(
@@ -137,35 +81,24 @@ def create_polygon_from_bbox(
     ymin: float,
     xmax: float,
     ymax: float,
-    crs: str,
+    crs: CRSLike,
 ) -> gpd.GeoDataFrame:
+    """Create a single-row polygon GeoDataFrame from a bounding box.
+
+    Args:
+        xmin: Minimum x-coordinate of the bounding box.
+        ymin: Minimum y-coordinate of the bounding box.
+        xmax: Maximum x-coordinate of the bounding box.
+        ymax: Maximum y-coordinate of the bounding box.
+        crs: Coordinate reference system for the polygon (EPSG string, PROJ dict, or :class:`pyproj.CRS`).
+
+    Returns:
+        A GeoDataFrame containing one polygon row with the requested CRS.
+
+    Notes:
+        This helper is used by CLI workflows to derive an Area of Interest (AOI)
+        polygon from raw numeric extents prior to reprojection, clipping, and IO. [1](https://doimspp-my.sharepoint.com/personal/smwesten_usgs_gov/Documents/Microsoft%20Copilot%20Chat%20Files/test_paths.py)
     """
-    Create a single-row GeoDataFrame polygon from a bounding box.
-
-    Parameters
-    ----------
-    xmin, ymin, xmax, ymax : float
-        Bounding-box coordinates in the target/project CRS.
-    crs : str
-        CRS string (e.g., ``"EPSG:5070"``).
-
-    Returns
-    -------
-    geopandas.GeoDataFrame
-        Single-row GeoDataFrame with the bounding-box polygon in
-        the specified CRS.
-
-    Notes
-    -----
-    This supports the CLI mode that supplies an AOI as a bounding box.
-
-    Examples
-    --------
-    >>> gdf = create_polygon_from_bbox(0, 0, 1000, 1000, "EPSG:5070")
-    >>> gdf.crs.to_string()
-    'EPSG:5070'
-    """
-    from shapely.geometry import box
-
-    geom = box(xmin, ymin, xmax, ymax)
-    return gpd.GeoDataFrame({"geometry": [geom]}, crs=crs)
+    polygon = box(xmin, ymin, xmax, ymax)
+    gdf = gpd.GeoDataFrame({"geometry": [polygon]}, crs=crs)
+    return gdf

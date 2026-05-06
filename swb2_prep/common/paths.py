@@ -8,7 +8,10 @@ Rules:
 - Output label comes from polygon name or "bounding_box"
 """
 
+from __future__ import annotations
+
 from pathlib import Path
+from typing import Optional
 
 def ensure_dir(path):
     """
@@ -29,38 +32,52 @@ def ensure_dir(path):
     return p
 
 
-def build_output_filename(base, resolution, units, ext, prefix=None):
-    """
-    Construct a standardized SWB output filename.
+def build_output_filename(
+    base: str,
+    resolution: float,
+    units: str,
+    ext: str,
+    prefix: Optional[str] = None,
+) -> str:
+    """Construct a standardized SWB output filename.
+
+    The convention is: ``{prefix}__{base}__{resolution}{units}{ext}``.
 
     Examples:
-        AWC__30m__basin.asc
-        HSG__325ft__bounding_box.tif
+        - ``south_manitou__landuse__30m.tif``
+        - ``HSG__325ft.tif``
 
-    Parameters
-    ----------
-    base : str
-        Base dataset name, e.g., "AWC" or "HSG".
-    resolution : int or float
-        Resolution in project CRS units.
-    units : str
-        Units (e.g., "m", "ft").
-    ext : str
-        Extension including leading dot (".tif" or ".asc").
-    prefix : str
-        Optional prefix value.
+    Behavior:
+        - **Extension normalization:** Accepts ``ext`` with or without a leading dot; always returns with a dot.
+        - **Resolution formatting:** If ``resolution`` is integral (e.g., ``30.0``), it is rendered as an integer (``30``); otherwise, the original float is used.
+        - **Prefix joining:** If a ``prefix`` is provided, it becomes the first segment, followed by ``base`` and the ``{resolution}{units}`` token.
 
-    Returns
-    -------
-    str
-        Constructed filename.
+    Args:
+        base: Base label (e.g., ``'landuse'``, ``'HSG'``).
+        resolution: Cell size (e.g., ``30`` or ``30.0``).
+        units: Units for resolution (e.g., ``'m'`` or ``'ft'``).
+        ext: File extension with or without leading dot (e.g., ``'.tif'`` or ``'tif'``).
+        prefix: Optional prefix, commonly an AOI/project label (e.g., ``'south_manitou'``).
+
+    Returns:
+        Filename string (no directory component).
+
+    Notes:
+        - Your tests validate extension normalization and the presence of base, resolution+units,
+          and prefix when supplied, ensuring deterministic naming across outputs. [3](https://doimspp-my.sharepoint.com/personal/smwesten_usgs_gov/Documents/Microsoft%20Copilot%20Chat%20Files/test_ops.py)
     """
-    # Normalize extension
-    if not ext.startswith("."):
-        ext = "." + ext
+    normalized_ext = ext if ext.startswith(".") else f".{ext}"
 
-    res_str = f"{resolution}{units}"
-    if prefix is not None:
-        return f"{prefix}__{base}__{res_str}{ext}"
+    if float(resolution).is_integer():
+        res_str = f"{int(resolution)}"
     else:
-        return f"{base}__{res_str}{ext}"
+        res_str = f"{resolution}"
+
+    parts = []
+    if prefix:
+        parts.append(prefix)
+    parts.append(base)
+    parts.append(f"{res_str}{units}")
+
+    name = "__".join(parts) + normalized_ext
+    return name

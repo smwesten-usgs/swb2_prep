@@ -16,7 +16,9 @@ import geopandas as gpd
 from pyproj import CRS as _CRS
 
 from swb2_prep.common.config import load_project_options
-from swb2_prep.common.griddef import write_grid_definition
+from swb2_prep.common.griddef import ( read_grid_definition,
+                                       write_grid_definition,
+                                       griddef_to_polygon_gdf )
 from swb2_prep.common.grids import reproject_polygon
 from swb2_prep.common.ops import create_polygon_from_bbox
 
@@ -204,6 +206,12 @@ def main() -> None:
     print(f"Source:     {source}")
     print(f"Snap mode:  {args.snap} (not applied yet)")
     
+    
+    gdf = griddef_to_polygon_gdf(grid)
+
+    # YOU save it (outside the assistant)
+    gdf.to_file(out_dir / "swb_grid.shp")
+
 
 if __name__ == "__main__":
     main()

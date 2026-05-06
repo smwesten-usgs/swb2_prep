@@ -1,22 +1,28 @@
 # prep_landuse_input.py
 # -*- coding: utf-8 -*-
-"""
-Prepare landuse raster for SWB model input (XR-first pipeline).
+"""Prepare landuse raster for SWB model input (XR-first pipeline).
 
-This script implements the SWB2-prep raster-processing workflow:
+Workflow:
+    - Load project settings from a 'project_options.toml'.
+    - Load the area-of-interest (AOI) polygon or bounding box.
+    - Read the input raster as an xarray.DataArray (CRS/transform via rioxarray).
+    - Reproject → project CRS (if needed).
+    - Resample → project resolution (if needed).
+    - Clip → AOI polygon.
+    - Write GeoTIFF + ArcASCII outputs.
+    - Print minimal grid metadata useful for SWB control-file generation.
 
-1. Load project settings
-2. Load the area-of-interest (AOI) polygon or bounding box
-3. Load the input raster as xarray.DataArray
-4. Reproject → project CRS (if needed)
-5. Resample → project resolution (if needed)
-6. Clip → AOI polygon
-7. Write GeoTIFF + ArcASCII outputs
-8. Print grid metadata for SWB control-file generation
+CLI contract (current behavior):
+    - Required flags: --input, --output-dir, --polygon
+    - Optional flags: --bbox (XMIN YMIN XMAX YMAX), --resampling,
+      --polygon-name, --polygon-value
+    - Optional: --config PATH to explicitly point at a 'project_options.toml';
+      if omitted, the CLI reads 'project_options.toml' from the subprocess
+      current working directory (CWD), as validated by tests.
 
 Design:
-- Procedural CLI with argparse + pathlib
-- XR-first functions from swb2_prep/common (rioxarray + rasterio under the hood)
+    - Procedural CLI using argparse + pathlib.
+    - XR-first functions from swb2_prep/common (rioxarray + rasterio under the hood).
 """
 
 import gc
@@ -45,107 +51,68 @@ from swb2_prep.common.paths import (
     ensure_dir,
     build_output_filename,
 )
+from swb2_prep.common.cli_args import (
+    add_common_io_args, 
+    add_common_aoi_args
+)
 
 def parse_args() -> argparse.Namespace:
-    """
-    Parse command-line arguments.
+    """Parse command-line arguments for the landuse preprocessing CLI.
 
-    Returns
-    -------
-    argparse.Namespace
-        Parsed CLI arguments:
+    Returns:
+        argparse.Namespace: Parsed arguments including:
 
-        --input : str
-            Input landuse raster (GeoTIFF).
-        --output-dir : str, optional
-            Directory for output files (default from project options).
-        --polygon : str, optional
-            AOI shapefile path.
-        --polygon-name : str, optional
-            Field name used to select AOI polygon.
-        --polygon-value : str, optional
-            Field value used to select AOI polygon.
-        --bbox : float xmin ymin xmax ymax, optional
-            AOI bounding box coordinates in project CRS.
-        --config : str, optional
-            Path to project_options.toml (default: project_options.toml).
+        Required:
+            --input (Path): Path to the source landuse raster.
+            --output-dir (Path): Directory to write outputs (GeoTIFF + ArcASCII).
+            --polygon (Path): AOI polygon dataset (e.g., a shapefile or GeoPackage).
+
+        Optional:
+            --bbox (float x4): AOI as bounding box coordinates (XMIN YMIN XMAX YMAX) in the
+                project CRS.
+            --polygon-name (str): Attribute/field name used to select a single AOI feature;
+                requires --polygon-value.
+            --polygon-value (str): Attribute value used to select a single AOI feature;
+                requires --polygon-name.
+            --config (Path): Optional path to 'project_options.toml'. If omitted, the CLI
+                reads 'project_options.toml' from the subprocess CWD (the test suite depends
+                on this default behavior).
+
+    Notes:
+        The end-to-end tests assert that the CLI finds 'project_options.toml' in its
+        working directory and that AOI ambiguity rules are enforced (supplying only
+        --polygon-name or only --polygon-value must raise errors).
     """
     p = argparse.ArgumentParser(
         description="Prepare landuse raster for SWB project (XR-first)."
     )
-
-    p.add_argument(
-        "--input",
-        required=True,
-        help="Input landuse raster (GeoTIFF)."
-    )
-
-    p.add_argument(
-        "--output-dir",
-        required=False,
-        help="Directory for output files."
-    )
-
-    # AOI modes
-    p.add_argument(
-        "--polygon",
-        help="AOI shapefile."
-    )
-    p.add_argument(
-        "--polygon-name",
-        help="Field name in shapefile used to select polygon (optional)."
-    )
-    p.add_argument(
-        "--polygon-value",
-        help="Field value used to select polygon (optional)."
-    )
-    p.add_argument(
-        "--bbox",
-        nargs=4,
-        type=float,
-        metavar=("xmin", "ymin", "xmax", "ymax"),
-        help="Bounding box coordinates in project CRS."
-    )
-
-    p.add_argument(
-        "--config",
-        default="project_options.toml",
-        help="Path to project_options.toml (default: project_options.toml)"
-    )
-
+    add_common_io_args(p)
+    add_common_aoi_args(p)
     return p.parse_args()
 
 
 def load_aoi(args: argparse.Namespace, project_crs: str) -> gpd.GeoDataFrame:
-    """
-    Load the AOI polygon from a shapefile or a bounding box, returning a
-    single-row GeoDataFrame in the project CRS.
+    """Load the AOI polygon from a dataset or a bounding box, then reproject to the project CRS.
 
-    Selection rules for shapefile AOIs
-    ----------------------------------
-    1) If both ``--polygon-name`` and ``--polygon-value`` are supplied:
-       - Select polygons where the field equals the specified value.
-       - If zero matches → error; if one match → OK; if >1 → error (ambiguous).
-    2) If neither is supplied:
-       - If shapefile contains exactly one polygon → OK; else → error.
-    3) If only one of the pair is supplied → error.
+    Args:
+        args: Parsed CLI arguments containing either --polygon or --bbox, optionally with
+            --polygon-name/--polygon-value to select a single feature.
+        project_crs: Project CRS string (e.g., "EPSG:5070").
 
-    Parameters
-    ----------
-    args : argparse.Namespace
-        Parsed command-line arguments.
-    project_crs : str
-        Project CRS string (e.g., "EPSG:5070").
+    Returns:
+        GeoDataFrame containing a single AOI polygon in the project CRS. If --polygon-name
+        and --polygon-value are provided, the AOI is narrowed to a single feature via
+        attribute selection and dissolved if multiple matches.
 
-    Returns
-    -------
-    geopandas.GeoDataFrame
-        Single-row GeoDataFrame containing the AOI polygon in ``project_crs``.
+    Raises:
+        ValueError:
+            - If both or neither of --polygon and --bbox are provided.
+            - If only one of --polygon-name or --polygon-value is given.
+            - If the specified attribute name does not exist in the polygon dataset.
 
-    Raises
-    ------
-    ValueError
-        If AOI selection is ambiguous or inconsistent with options.
+    Notes:
+        The AOI polygon is reprojected to the project CRS prior to clipping. Tests assert
+        the AOI selection error rules and CWD-based project options behavior.
     """
     # BOUNDING BOX MODE
     if args.bbox:
@@ -203,41 +170,23 @@ def load_aoi(args: argparse.Namespace, project_crs: str) -> gpd.GeoDataFrame:
 
 
 def main() -> None:
-    """
-    Execute the landuse preprocessing workflow (XR-first).
+    """Execute the XR-first landuse preprocessing workflow.
 
-    Steps
-    -----
-    1. Read project settings from ``project_options.toml``.
-    2. Load AOI using shapefile or bounding box (reproject to project CRS).
-    3. Read input raster as xarray.DataArray.
-    4. Reproject raster to project CRS (if needed).
-    5. Resample raster to project resolution (if needed).
-    6. Clip raster to AOI polygon.
-    7. Write GeoTIFF and ArcASCII outputs.
-    8. Print grid metadata for SWB control-file generation.
+    Steps:
+        1) Load project options from a 'project_options.toml':
+           - If --config PATH is supplied, load from that path.
+           - Otherwise, load 'project_options.toml' from the subprocess CWD (as the tests expect).
+        2) Load AOI (polygon or bbox) and reproject to project CRS.
+        3) Read input raster via rioxarray (CRS/transform attached).
+        4) Reproject → project CRS (if needed).
+        5) Resample → project resolution (if needed).
+        6) Clip → AOI polygon.
+        7) Write GeoTIFF + ArcASCII outputs with standardized filenames.
+        8) Print minimal grid metadata for downstream SWB control-file generation.
 
-    Prints
-    ------
-    int
-        Number of columns in processed raster (nx).
-    int
-        Number of rows in processed raster (ny).
-    float
-        Lower-left x-coordinate (llx).
-    float
-        Lower-left y-coordinate (lly).
-    float
-        Grid resolution.
-    str
-        proj4 string of CRS.
-
-    Raises
-    ------
-    FileNotFoundError
-        If input files cannot be located.
-    ValueError
-        For AOI selection or CRS/resolution inconsistencies.
+    Notes:
+        The CLI contract and AOI rules are validated by the end-to-end tests; keep behavior
+        explicit and avoid implicit changes to arguments or IO semantics.
     """
     args = parse_args()
 
