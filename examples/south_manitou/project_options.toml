@@ -1,77 +1,36 @@
-# ================================================================
-# Project-wide configuration for swb2_prep CLIs
-# ================================================================
-
 [project]
-# The CRS all rasters and AOI polygons will be reprojected into.
-# Use any valid PROJ string or EPSG code.
 crs = "EPSG:5070"
-
-# Grid cell size, expressed in project CRS units.
 resolution = 30.0
-
-# Units used for naming output files (e.g., "m", "ft")
-# These describe the resolution units.
 units = "m"
 
-# ================================================================
-# Input and Output Paths
-# ================================================================
-
 [paths]
-# Directory containing your raw input rasters and shapefiles.
-# This can be absolute or relative.
 input_dir = "data"
-
-# Directory where processed rasters (GeoTIFF + ArcASCII) will be saved.
 output_dir = "output"
 
-# ================================================================
-# AOI Selection
-# ================================================================
-# The CLI allows AOI selection in two ways:
-#   1. Polygon shapefile
-#   2. Bounding box (xmin, ymin, xmax, ymax)
-#
-# Only one mode is used per run, but config provides defaults.
-
 [aoi]
-# Full path to the AOI polygon file (ESRI Shapefile required)
-polygon = "data/aoi.shp"
-
-# Optional: attribute field + value to select exactly one polygon
-# Leave both empty if shapefile contains only one polygon.
+bbox = []
+polygon = "..\\..\\data\\aoi.shp"
 polygon_name = ""
 polygon_value = ""
 
-# Alternatively:
-# bbox = [xmin, ymin, xmax, ymax]
+[grid]
+crs = "EPSG:5070"
+proj4 = "+proj=aea +lat_0=23 +lon_0=-96 +lat_1=29.5 +lat_2=45.5 +x_0=0 +y_0=0 +datum=NAD83 +units=m +no_defs +type=crs"
+resolution = 30.0
+snap = "outward"
+source = "aoi_polygon"
+xmin_raw = 772994.6515829079
+ymin_raw = 2485003.7135628797
+xmax_raw = 779770.0854417123
+ymax_raw = 2491779.147421684
+xmin = 772980.0
+ymin = 2484990.0
+xmax = 779790.0
+ymax = 2491800.0
+nx = 227
+ny = 227
 
-# ================================================================
-# Landuse Raster
-# ================================================================
-[landuse]
-# Path to the raw landuse raster.
-raster = "data/cdl__south_manitou.tif"
-
-# ================================================================
-# Soil Inputs (Optional sections for other CLIs)
-# ================================================================
-[awc]
-raster = "data/awc_raw.tif"
-
-[hsg]
-raster = "data/hsg_raw.tif"
-
-# ================================================================
-# D8 Flow Direction (Optional)
-# ================================================================
-[d8]
-raster = "data/dem_filled.tif"
-
-# ================================================================
-# Weather / Other Future Datasets
-# ================================================================
-[weather]
-precip = ""
-temp = ""
+[provenance]
+generated_by = "define_swb_grid.py"
+generated_on = "2026-05-08T21:14:36+00:00"
+version = "0.1.0"

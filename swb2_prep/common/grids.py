@@ -22,6 +22,7 @@ import xarray as xr
 import geopandas as gpd
 from rasterio.warp import Resampling
 from shapely.geometry import box
+from typing import Tuple
 from swb2_prep.common.utils import CRSLike
 
 def reproject_raster_xr(
@@ -164,3 +165,93 @@ def create_polygon_from_bbox(xmin: float, ymin: float, xmax: float, ymax: float,
     """
     geom = box(xmin, ymin, xmax, ymax)
     return gpd.GeoDataFrame({"geometry": [geom]}, crs=crs)
+
+
+def snap_extent(
+    xmin_raw: float,
+    ymin_raw: float,
+    xmax_raw: float,
+    ymax_raw: float,
+    resolution: float,
+    mode: str = "outward",
+) -> Tuple[float, float, float, float]:
+    """Snap raw extent to a resolution grid.
+
+    Args:
+        xmin_raw: Raw xmin.
+        ymin_raw: Raw ymin.
+        xmax_raw: Raw xmax.
+        ymax_raw: Raw ymax.
+        resolution: Cell size in project CRS units.
+        mode: Snapping mode: ``'outward'`` (expand) or ``'inward'`` (shrink).
+
+    Returns:
+        Tuple of ``(xmin, ymin, xmax, ymax)`` representing snapped extent.
+
+    Raises:
+        ValueError: If ``resolution`` is non-positive or the snapped extent collapses.
+
+    Notes:
+        - Outward: floor(min), ceil(max) to fully cover AOI.
+        - Inward: ceil(min), floor(max) to ensure all cells lie within AOI.
+    """
+    if resolution <= 0:
+        raise ValueError("Resolution must be positive.")
+    if mode not in {"outward", "inward"}:
+        raise ValueError(f"Unsupported snap mode: {mode!r}")
+
+    if mode == "outward":
+        xmin = np.floor(xmin_raw / resolution) * resolution
+        ymin = np.floor(ymin_raw / resolution) * resolution
+        xmax = np.ceil(xmax_raw / resolution) * resolution
+        ymax = np.ceil(ymax_raw / resolution) * resolution
+    else:
+        xmin = np.ceil(xmin_raw / resolution) * resolution
+        ymin = np.ceil(ymin_raw / resolution) * resolution
+        xmax = np.floor(xmax_raw / resolution) * resolution
+        ymax = np.floor(ymax_raw / resolution) * resolution
+
+    if xmax <= xmin or ymax <= ymin:
+        raise ValueError("Snapped extent collapsed; check resolution and AOI bounds.")
+
+    return xmin, ymin, xmax, ymax
+
+
+def compute_grid_dims(
+    xmin: float,
+    ymin: float,
+    xmax: float,
+    ymax: float,
+    resolution: float,
+) -> Tuple[int, int]:
+    """Compute grid dimensions (nx, ny) from snapped extent and resolution.
+
+    Args:
+        xmin: Snapped xmin.
+        ymin: Snapped ymin.
+        xmax: Snapped xmax.
+        ymax: Snapped ymax.
+        resolution: Cell size (units of the CRS).
+
+    Returns:
+        Tuple of ``(nx, ny)`` where ``nx`` is columns and ``ny`` is rows.
+
+    Raises:
+        ValueError: If ``resolution`` is non-positive or extent is invalid.
+
+    Notes:
+        - Uses width/height divided by resolution, rounded to nearest integer.
+          Extents are expected to be exact multiples after snapping.
+    """
+    if resolution <= 0:
+        raise ValueError("Resolution must be positive.")
+    width = xmax - xmin
+    height = ymax - ymin
+    if width <= 0 or height <= 0:
+        raise ValueError("Invalid extent; width/height must be positive.")
+
+    nx = int(round(width / resolution))
+    ny = int(round(height / resolution))
+    if nx <= 0 or ny <= 0:
+        raise ValueError("Computed grid dimensions are non-positive.")
+    return nx, ny

@@ -1,269 +1,250 @@
-# prep_landuse_input.py
+# swb2_prep/cli/prep_landuse_input.py
 # -*- coding: utf-8 -*-
-"""Prepare landuse raster for SWB model input (XR-first pipeline).
 
-Workflow:
-    - Load project settings from a 'project_options.toml'.
-    - Load the area-of-interest (AOI) polygon or bounding box.
-    - Read the input raster as an xarray.DataArray (CRS/transform via rioxarray).
-    - Reproject → project CRS (if needed).
-    - Resample → project resolution (if needed).
-    - Clip → AOI polygon.
-    - Write GeoTIFF + ArcASCII outputs.
-    - Print minimal grid metadata useful for SWB control-file generation.
+"""
+Prepare the landuse raster using the canonical grid defined in 'project_options.toml'.
 
-CLI contract (current behavior):
-    - Required flags: --input, --output-dir, --polygon
-    - Optional flags: --bbox (XMIN YMIN XMAX YMAX), --resampling,
-      --polygon-name, --polygon-value
-    - Optional: --config PATH to explicitly point at a 'project_options.toml';
-      if omitted, the CLI reads 'project_options.toml' from the subprocess
-      current working directory (CWD), as validated by tests.
+This CLI:
+- Loads the single TOML ('--project-options'), reads the canonical [grid] section.
+- Reprojects the landuse raster to the grid CRS.
+- Resamples and aligns it to the exact grid extent (xmin/ymax origin, resolution, nx/ny).
+- Writes a typed GeoTIFF (and optionally ESRI Arc ASCII) to the output directory.
 
-Design:
-    - Procedural CLI using argparse + pathlib.
-    - XR-first functions from swb2_prep/common (rioxarray + rasterio under the hood).
+Assumptions (explicit and simple):
+- '[grid]' in the TOML is authoritative for CRS, resolution, and extents.
+- If '[grid]' is missing, error out.
+- Landuse raster is a single-band categorical/int raster; use dtype and nodata via CLI flags.
+
+Examples
+--------
+Run from your project directory or example directory:
+
+    python -m swb2_prep.cli.prep_landuse_input ^
+        --project-options project_options.toml ^
+        --input ..\\..\\data\\cdl__south_manitou.tif ^
+        --output-dir output ^
+        --dtype uint16 ^
+        --nodata 0 ^
+        --write-asc
+
 """
 
-import gc
+from __future__ import annotations
+
 import argparse
 from pathlib import Path
-import geopandas as gpd
-from pyproj import CRS as _CRS
-from rasterio.enums import Resampling
+from typing import Optional, Tuple
 
+import numpy as np
+import xarray as xr
+from rasterio.transform import Affine
+from pyproj import CRS as _CRS
+
+from swb2_prep.common.cli_args import add_common_io_args
+from swb2_prep.common.cli_args import add_common_aoi_args  # for --project-options
 from swb2_prep.common.config import load_project_options
-from swb2_prep.common.grids import (
-    reproject_raster_xr,
-    reproject_polygon,
-    resample_raster_xr,
-)
-from swb2_prep.common.ops import (
-    clip_raster_to_polygon_xr,
-    create_polygon_from_bbox,
-)
 from swb2_prep.common.io import (
     read_raster_xr,
+    ensure_dtype_and_nodata,
     write_geotiff_xr,
     write_arc_ascii,
 )
-from swb2_prep.common.paths import (
-    ensure_dir,
-    build_output_filename,
-)
-from swb2_prep.common.cli_args import (
-    add_common_io_args, 
-    add_common_aoi_args
-)
+from swb2_prep.common.paths import build_output_filename
+from swb2_prep.common.utils import PathLike
+
 
 def parse_args() -> argparse.Namespace:
-    """Parse command-line arguments for the landuse preprocessing CLI.
+    """Parse CLI arguments for preparing the landuse raster.
 
     Returns:
-        argparse.Namespace: Parsed arguments including:
-
-        Required:
-            --input (Path): Path to the source landuse raster.
-            --output-dir (Path): Directory to write outputs (GeoTIFF + ArcASCII).
-            --polygon (Path): AOI polygon dataset (e.g., a shapefile or GeoPackage).
-
-        Optional:
-            --bbox (float x4): AOI as bounding box coordinates (XMIN YMIN XMAX YMAX) in the
-                project CRS.
-            --polygon-name (str): Attribute/field name used to select a single AOI feature;
-                requires --polygon-value.
-            --polygon-value (str): Attribute value used to select a single AOI feature;
-                requires --polygon-name.
-            --config (Path): Optional path to 'project_options.toml'. If omitted, the CLI
-                reads 'project_options.toml' from the subprocess CWD (the test suite depends
-                on this default behavior).
-
-    Notes:
-        The end-to-end tests assert that the CLI finds 'project_options.toml' in its
-        working directory and that AOI ambiguity rules are enforced (supplying only
-        --polygon-name or only --polygon-value must raise errors).
+        argparse.Namespace: Parsed arguments containing paths, typing, and output flags.
     """
-    p = argparse.ArgumentParser(
-        description="Prepare landuse raster for SWB project (XR-first)."
+    parser = argparse.ArgumentParser(
+        description="Prepare the landuse raster aligned to the canonical [grid] in project_options.toml."
     )
-    add_common_io_args(p)
-    add_common_aoi_args(p)
-    return p.parse_args()
+    # We need --input, --output-dir, and --project-options.
+    add_common_io_args(parser)
+    add_common_aoi_args(parser)  # includes --project-options
+
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default="uint16",
+        help="Output dtype for landuse GeoTIFF (e.g., 'uint16', 'int16', 'float32'). Default: 'uint16'.",
+    )
+    parser.add_argument(
+        "--nodata",
+        type=float,
+        default=0.0,
+        help="NoData value for output rasters (representable in selected dtype). Default: 0.",
+    )
+    parser.add_argument(
+        "--compress",
+        type=str,
+        default="lzw",
+        help="Compression for GeoTIFF (e.g., 'lzw', 'deflate'). Default: 'lzw'.",
+    )
+    parser.add_argument(
+        "--write-asc",
+        default=True,
+        action="store_true",
+        help="Also write ESRI Arc ASCII Grid (.asc) alongside the GeoTIFF.",
+    )
+    parser.add_argument(
+        "--prefix",
+        type=str,
+        default="",
+        help="Optional filename prefix (e.g., project or AOI label) for outputs.",
+    )
+    return parser.parse_args()
 
 
-def load_aoi(args: argparse.Namespace, project_crs: str) -> gpd.GeoDataFrame:
-    """Load the AOI polygon from a dataset or a bounding box, then reproject to the project CRS.
+def _build_grid_affine_and_shape(
+    xmin: float,
+    ymin: float,
+    xmax: float,
+    ymax: float,
+    resolution: float,
+) -> Tuple[Affine, Tuple[int, int]]:
+    """Construct the upper-left Affine transform and shape from grid bounds and resolution.
 
     Args:
-        args: Parsed CLI arguments containing either --polygon or --bbox, optionally with
-            --polygon-name/--polygon-value to select a single feature.
-        project_crs: Project CRS string (e.g., "EPSG:5070").
+        xmin: Grid minimum x (snapped).
+        ymin: Grid minimum y (snapped).
+        xmax: Grid maximum x (snapped).
+        ymax: Grid maximum y (snapped).
+        resolution: Pixel size in CRS units.
 
     Returns:
-        GeoDataFrame containing a single AOI polygon in the project CRS. If --polygon-name
-        and --polygon-value are provided, the AOI is narrowed to a single feature via
-        attribute selection and dissolved if multiple matches.
-
-    Raises:
-        ValueError:
-            - If both or neither of --polygon and --bbox are provided.
-            - If only one of --polygon-name or --polygon-value is given.
-            - If the specified attribute name does not exist in the polygon dataset.
+        A tuple of (affine_transform, (ny, nx)) for the target grid.
 
     Notes:
-        The AOI polygon is reprojected to the project CRS prior to clipping. Tests assert
-        the AOI selection error rules and CWD-based project options behavior.
+        - Upper-left origin is (xmin, ymax), y pixel size is negative for north-up rasters.
     """
-    # BOUNDING BOX MODE
-    if args.bbox:
-        xmin, ymin, xmax, ymax = args.bbox
-        return create_polygon_from_bbox(xmin, ymin, xmax, ymax, project_crs)
+    width = xmax - xmin
+    height = ymax - ymin
+    nx = int(round(width / resolution))
+    ny = int(round(height / resolution))
+    transform = Affine.translation(xmin, ymax) * Affine.scale(resolution, -resolution)
+    return transform, (ny, nx)
 
-    # POLYGON MODE
-    if not args.polygon:
-        raise ValueError("Either --polygon or --bbox must be provided.")
 
-    gdf = gpd.read_file(args.polygon)
+def _make_grid_template(
+    crs: str,
+    transform: Affine,
+    shape: Tuple[int, int],
+) -> xr.DataArray:
+    """Create an empty XR DataArray template carrying CRS/transform for reproject_match.
 
-    has_name = args.polygon_name is not None
-    has_value = args.polygon_value is not None
+    Args:
+        crs: Canonical CRS string (e.g., 'EPSG:5070').
+        transform: Upper-left affine transform of the target grid.
+        shape: (ny, nx) grid shape.
 
-    # Case 3: Only one provided → error
-    if has_name ^ has_value:
-        raise ValueError(
-            "Both --polygon-name and --polygon-value must be provided "
-            "together, or neither."
-        )
-
-    # Case 1: Both provided → attribute selection
-    if has_name and has_value:
-        field = args.polygon_name
-        value = args.polygon_value
-
-        if field not in gdf.columns:
-            raise ValueError(f"Field {field!r} not found in shapefile.")
-
-        sel = gdf[gdf[field] == value]
-
-        if len(sel) == 0:
-            raise ValueError(f"No polygons found where {field} == {value!r}.")
-        if len(sel) > 1:
-            raise ValueError(
-                f"Multiple polygons match {field} == {value!r}. "
-                "Selection is ambiguous."
-            )
-
-        gdf = sel
-
-    # Case 2: Neither supplied → require 1 polygon
-    elif not has_name and not has_value:
-        if len(gdf) == 0:
-            raise ValueError("Shapefile contains no polygons.")
-        if len(gdf) > 1:
-            raise ValueError(
-                "Shapefile contains multiple polygons; "
-                "must provide --polygon-name and --polygon-value."
-            )
-
-    # Reproject to project CRS
-    return reproject_polygon(gdf, project_crs)
+    Returns:
+        xarray.DataArray with 'y' and 'x' dims, CRS/transform written via .rio.
+    """
+    ny, nx = shape
+    template = xr.DataArray(
+        np.zeros((ny, nx), dtype="float32"),
+        dims=("y", "x"),
+        name="template",
+    )
+    template = template.rio.write_crs(_CRS.from_user_input(crs).to_string(), inplace=False)
+    template = template.rio.write_transform(transform, inplace=False)
+    return template
 
 
 def main() -> None:
-    """Execute the XR-first landuse preprocessing workflow.
+    """Entry point for preparing the landuse raster aligned to `[grid]` in the TOML.
 
     Steps:
-        1) Load project options from a 'project_options.toml':
-           - If --config PATH is supplied, load from that path.
-           - Otherwise, load 'project_options.toml' from the subprocess CWD (as the tests expect).
-        2) Load AOI (polygon or bbox) and reproject to project CRS.
-        3) Read input raster via rioxarray (CRS/transform attached).
-        4) Reproject → project CRS (if needed).
-        5) Resample → project resolution (if needed).
-        6) Clip → AOI polygon.
-        7) Write GeoTIFF + ArcASCII outputs with standardized filenames.
-        8) Print minimal grid metadata for downstream SWB control-file generation.
+        1) Load project_options.toml and confirm '[grid]' exists.
+        2) Read the input landuse raster with CRS/transform via rioxarray.
+        3) Reproject to grid CRS and resample to the grid extent/resolution.
+        4) Write GeoTIFF (typed) and optionally ESRI Arc ASCII.
 
-    Notes:
-        The CLI contract and AOI rules are validated by the end-to-end tests; keep behavior
-        explicit and avoid implicit changes to arguments or IO semantics.
+    Raises:
+        FileNotFoundError: If '--project-options' file does not exist.
+        KeyError: If '[grid]' section is missing from the TOML.
+        ValueError: For invalid dtype/nodata semantics or missing CRS/transform in input raster.
     """
     args = parse_args()
 
-    # 1. Load project options
-    opts = load_project_options(args.config)
-    project_crs = opts["project"]["crs"]
-    project_resolution = opts["project"]["resolution"]
-    project_units = opts["project"]["units"]
+    project_path: Path = args.project_options
+    if not project_path.exists():
+        raise FileNotFoundError(f"Project options TOML not found: {project_path}")
 
-    output_dir = ensure_dir(Path(args.output_dir or opts["paths"]["output_dir"]))
+    # Load TOML and extract canonical grid parameters
+    opts = load_project_options(project_path)
+    if "grid" not in opts:
+        raise KeyError("The project_options.toml is missing the [grid] section.")
+    grid = opts["grid"]
 
-    # 2. Load AOI (GeoDataFrame in project CRS)
-    aoi_gdf = load_aoi(args, project_crs)
+    grid_crs: str = str(grid["crs"])
+    resolution: float = float(grid["resolution"])
+    xmin: float = float(grid["xmin"])
+    ymin: float = float(grid["ymin"])
+    xmax: float = float(grid["xmax"])
+    ymax: float = float(grid["ymax"])
 
-    # 3. Load input raster as DataArray (CRS/transform via .rio)
-    da = read_raster_xr(args.input)  # masked=True by default (NoData -> NaN)
+    # Build the target grid transform and shape
+    transform, (ny, nx) = _build_grid_affine_and_shape(xmin, ymin, xmax, ymax, resolution)
+    template = _make_grid_template(grid_crs, transform, (ny, nx))
 
-    # 4/5. Reproject and/or resample to project CRS/resolution
-    if str(da.rio.crs) != str(project_crs):
-        da = reproject_raster_xr(da, project_crs, resolution=project_resolution)
-    else:
-        xres = float(da.rio.transform().a)
-        da = resample_raster_xr(da, target_resolution=project_resolution)
+    # Read input landuse raster
+    landuse_da = read_raster_xr(args.input, masked=True)
 
-    # 6. Clip raster to AOI polygon (auto-reprojects AOI if CRSs differ)
-    da = clip_raster_to_polygon_xr(da, aoi_gdf)
+    # Reproject and align to the canonical grid
+    # Using rioxarray's reproject to target CRS first (if needed), then reproject_match to template.
+    if str(landuse_da.rio.crs) != _CRS.from_user_input(grid_crs).to_string():
+        landuse_da = landuse_da.rio.reproject(grid_crs)
 
-    # 7. Build output filenames
-    fname_tif = build_output_filename(
-        base="landuse",
-        resolution=project_resolution,
-        units=project_units,
-        ext=".tif",
-    )
-    fname_asc = build_output_filename(
-        base="landuse",
-        resolution=project_resolution,
-        units=project_units,
-        ext=".asc",
-    )
+    # Resample/align to the grid template (exact extent, resolution, and shape)
+    landuse_da_aligned = landuse_da.rio.reproject_match(template)
 
-    # 8. Write outputs (explicit dtype keeps GeoTIFF predictable)
+    # Ensure dtype and nodata as requested
+    dtype: str = args.dtype
+    nodata_val: Optional[float] = args.nodata
+    landuse_typed = ensure_dtype_and_nodata(landuse_da_aligned, dtype=dtype, nodata=nodata_val)
+
+    # Build output filenames
+    units = str(opts.get("project", {}).get("units", "m"))
+    base = "landuse"
+    prefix = args.prefix if args.prefix else ""
+    geotiff_name = build_output_filename(base=base, resolution=resolution, units=units, ext=".tif", prefix=prefix)
+    ascii_name = build_output_filename(base=base, resolution=resolution, units=units, ext=".asc", prefix=prefix)
+
+    # Write GeoTIFF
+    out_dir: Path = args.output_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    geotiff_path = out_dir / geotiff_name
     write_geotiff_xr(
-        output_dir / fname_tif,
-        da,
-        dtype="uint8",
-        nodata=255,
-        compress="LZW",
+        geotiff_path,
+        landuse_typed,
+        dtype=dtype,
+        nodata=nodata_val,
+        compress=args.compress,
         tiled=True,
     )
 
-    write_arc_ascii(
-        output_dir / fname_asc,
-        da,
-        dtype="int16",
-        transform=da.rio.transform(),
-        crs=da.rio.crs,
-        nodata=-9999,
-        decimal_precision=0,
-        force_cellsize=True,
-    )
+    print(f"Wrote landuse GeoTIFF: {geotiff_path}")
 
-    # 9. Print control-file metadata (lower-left from upper-left transform)
-    nx = da.sizes["x"]
-    ny = da.sizes["y"]
-    T = da.rio.transform()
-    llx = T.c
-    lly = T.f + T.e * ny  # lower-left y from upper-left transform
-    # proj4 string (robust via pyproj)
-    try:
-        proj4 = _CRS.from_user_input(da.rio.crs).to_proj4()
-    except:
-        proj4 = str(da.rio.crs)
-    print(nx, ny, llx, lly, project_resolution, proj4)
-    
-    del da
-    gc.collect()
+    # Optionally write ESRI Arc ASCII
+    if args.write_asc:
+        write_arc_ascii(
+            out_dir / ascii_name,
+            landuse_typed,
+            dtype=dtype,
+            nodata=nodata_val,
+            transform=transform,
+            crs=grid_crs,
+            decimal_precision=None,
+            significant_digits=None,
+            force_cellsize=None,
+        )
+        print(f"Wrote landuse Arc ASCII: {out_dir / ascii_name}")
+
 
 if __name__ == "__main__":
     main()
