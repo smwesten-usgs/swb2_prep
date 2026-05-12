@@ -126,6 +126,7 @@ if __name__ == "__main__":
     raster_path = r"mukey__south_manitou.tif"
     gpkg_path   = r"gnatsgo__south_manitou.gpkg"
 
+    # Operate directly on the large CONUS raster and the original GPKG
 #    raster_path = r"muraster_30m.tif"
 #    gpkg_path   = r"gNATSGO_02_03_2025.gpkg"
 

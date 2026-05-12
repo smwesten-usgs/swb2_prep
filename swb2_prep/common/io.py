@@ -285,9 +285,9 @@ def write_arc_ascii(
     Notes:
         - The XR-first IO design ensures CRS/transform are managed through rioxarray;
           tests in your suite validate transform handling and typed output elsewhere,
-          and this function adheres to the same conventions. [1](https://doimspp-my.sharepoint.com/personal/smwesten_usgs_gov/Documents/Microsoft%20Copilot%20Chat%20Files/test_io.py)
+          and this function adheres to the same conventions. 
         - If your workflow starts with lower-left metadata, derive the correct
-          upper-left transform via ``lower_left_to_transform(...)`` prior to writing. [1](https://doimspp-my.sharepoint.com/personal/smwesten_usgs_gov/Documents/Microsoft%20Copilot%20Chat%20Files/test_io.py)
+          upper-left transform via ``lower_left_to_transform(...)`` prior to writing. 
     """
     dst = Path(out_path)
 

@@ -1,249 +1,126 @@
-# swb2_prep/cli/prep_landuse_input.py
 # -*- coding: utf-8 -*-
-
 """
-Prepare the landuse raster using the canonical grid defined in 'project_options.toml'.
+Prepare the landuse raster aligned to the canonical SWB grid template.
 
-This CLI:
-- Loads the single TOML ('--project-options'), reads the canonical [grid] section.
-- Reprojects the landuse raster to the grid CRS.
-- Resamples and aligns it to the exact grid extent (xmin/ymax origin, resolution, nx/ny).
-- Writes a typed GeoTIFF (and optionally ESRI Arc ASCII) to the output directory.
+Assumes `define_swb_grid.py` has already been run and that a grid template
+GeoTIFF (`swb_grid_template.tif`) exists. The template carries the authoritative
+CRS, transform, and shape; `reproject_match` handles all alignment in one call.
 
-Assumptions (explicit and simple):
-- '[grid]' in the TOML is authoritative for CRS, resolution, and extents.
-- If '[grid]' is missing, error out.
-- Landuse raster is a single-band categorical/int raster; use dtype and nodata via CLI flags.
-
-Examples
---------
-Run from your project directory or example directory:
-
+Usage:
     python -m swb2_prep.cli.prep_landuse_input ^
         --project-options project_options.toml ^
         --input ..\\..\\data\\cdl__south_manitou.tif ^
         --output-dir output ^
-        --dtype uint16 ^
-        --nodata 0 ^
-        --write-asc
-
+        --prefix south_manitou
 """
 
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Optional, Tuple
 
 import numpy as np
-import xarray as xr
-from rasterio.transform import Affine
-from pyproj import CRS as _CRS
+import rioxarray as rxr
+from rasterio.warp import Resampling
+import gc
 
-from swb2_prep.common.cli_args import add_common_io_args
-from swb2_prep.common.cli_args import add_common_aoi_args  # for --project-options
 from swb2_prep.common.config import load_project_options
-from swb2_prep.common.io import (
-    read_raster_xr,
-    ensure_dtype_and_nodata,
-    write_geotiff_xr,
-    write_arc_ascii,
-)
+from swb2_prep.common.io import ensure_dtype_and_nodata, write_geotiff_xr, write_arc_ascii
+from swb2_prep.common.log import setup_logging
 from swb2_prep.common.paths import build_output_filename
-from swb2_prep.common.utils import PathLike
+
+RESAMPLING_METHODS = {
+    "nearest": Resampling.nearest,
+    "bilinear": Resampling.bilinear,
+    "cubic": Resampling.cubic,
+}
 
 
 def parse_args() -> argparse.Namespace:
-    """Parse CLI arguments for preparing the landuse raster.
-
-    Returns:
-        argparse.Namespace: Parsed arguments containing paths, typing, and output flags.
-    """
+    """Parse CLI arguments for landuse raster preparation."""
     parser = argparse.ArgumentParser(
-        description="Prepare the landuse raster aligned to the canonical [grid] in project_options.toml."
+        description="Prepare landuse raster aligned to the SWB grid template."
     )
-    # We need --input, --output-dir, and --project-options.
-    add_common_io_args(parser)
-    add_common_aoi_args(parser)  # includes --project-options
-
-    parser.add_argument(
-        "--dtype",
-        type=str,
-        default="uint16",
-        help="Output dtype for landuse GeoTIFF (e.g., 'uint16', 'int16', 'float32'). Default: 'uint16'.",
-    )
-    parser.add_argument(
-        "--nodata",
-        type=float,
-        default=0.0,
-        help="NoData value for output rasters (representable in selected dtype). Default: 0.",
-    )
-    parser.add_argument(
-        "--compress",
-        type=str,
-        default="lzw",
-        help="Compression for GeoTIFF (e.g., 'lzw', 'deflate'). Default: 'lzw'.",
-    )
-    parser.add_argument(
-        "--write-asc",
-        default=True,
-        action="store_true",
-        help="Also write ESRI Arc ASCII Grid (.asc) alongside the GeoTIFF.",
-    )
-    parser.add_argument(
-        "--prefix",
-        type=str,
-        default="",
-        help="Optional filename prefix (e.g., project or AOI label) for outputs.",
-    )
+    parser.add_argument("--input", type=Path, required=True, help="Path to input landuse raster.")
+    parser.add_argument("--project-options", dest="project_options", type=Path,
+                        default=Path.cwd() / "project_options.toml",
+                        help="Path to project_options.toml (default: ./project_options.toml).")
+    parser.add_argument("--output-dir", dest="output_dir", type=Path, default=Path.cwd(),
+                        help="Output directory (default: current directory).")
+    parser.add_argument("--dtype", type=str, default="int16",
+                        help="Output dtype (default: int16).")
+    parser.add_argument("--nodata", type=float, default=-1.0,
+                        help="NoData value (default: -1).")
+    parser.add_argument("--compress", type=str, default="lzw",
+                        help="GeoTIFF compression (default: lzw).")
+    parser.add_argument("--prefix", type=str, default="",
+                        help="Optional filename prefix (e.g., project label).")
+    parser.add_argument("--resampling", type=str, choices=list(RESAMPLING_METHODS.keys()),
+                        default="nearest",
+                        help="Resampling method (default: nearest).")
+    parser.add_argument("--exclude-codes", dest="exclude_codes", type=int, nargs="+",
+                        default=None,
+                        help="Landuse codes to replace with nodata (e.g., 111 for open water).")
+    parser.add_argument("--no-log", dest="no_log", action="store_true", default=False,
+                        help="Suppress logging to file.")
     return parser.parse_args()
 
 
-def _build_grid_affine_and_shape(
-    xmin: float,
-    ymin: float,
-    xmax: float,
-    ymax: float,
-    resolution: float,
-) -> Tuple[Affine, Tuple[int, int]]:
-    """Construct the upper-left Affine transform and shape from grid bounds and resolution.
-
-    Args:
-        xmin: Grid minimum x (snapped).
-        ymin: Grid minimum y (snapped).
-        xmax: Grid maximum x (snapped).
-        ymax: Grid maximum y (snapped).
-        resolution: Pixel size in CRS units.
-
-    Returns:
-        A tuple of (affine_transform, (ny, nx)) for the target grid.
-
-    Notes:
-        - Upper-left origin is (xmin, ymax), y pixel size is negative for north-up rasters.
-    """
-    width = xmax - xmin
-    height = ymax - ymin
-    nx = int(round(width / resolution))
-    ny = int(round(height / resolution))
-    transform = Affine.translation(xmin, ymax) * Affine.scale(resolution, -resolution)
-    return transform, (ny, nx)
-
-
-def _make_grid_template(
-    crs: str,
-    transform: Affine,
-    shape: Tuple[int, int],
-) -> xr.DataArray:
-    """Create an empty XR DataArray template carrying CRS/transform for reproject_match.
-
-    Args:
-        crs: Canonical CRS string (e.g., 'EPSG:5070').
-        transform: Upper-left affine transform of the target grid.
-        shape: (ny, nx) grid shape.
-
-    Returns:
-        xarray.DataArray with 'y' and 'x' dims, CRS/transform written via .rio.
-    """
-    ny, nx = shape
-    template = xr.DataArray(
-        np.zeros((ny, nx), dtype="float32"),
-        dims=("y", "x"),
-        name="template",
-    )
-    template = template.rio.write_crs(_CRS.from_user_input(crs).to_string(), inplace=False)
-    template = template.rio.write_transform(transform, inplace=False)
-    return template
-
-
 def main() -> None:
-    """Entry point for preparing the landuse raster aligned to `[grid]` in the TOML.
-
-    Steps:
-        1) Load project_options.toml and confirm '[grid]' exists.
-        2) Read the input landuse raster with CRS/transform via rioxarray.
-        3) Reproject to grid CRS and resample to the grid extent/resolution.
-        4) Write GeoTIFF (typed) and optionally ESRI Arc ASCII.
-
-    Raises:
-        FileNotFoundError: If '--project-options' file does not exist.
-        KeyError: If '[grid]' section is missing from the TOML.
-        ValueError: For invalid dtype/nodata semantics or missing CRS/transform in input raster.
-    """
+    """Align landuse raster to the grid template and write GeoTIFF + Arc ASCII."""
     args = parse_args()
 
-    project_path: Path = args.project_options
-    if not project_path.exists():
-        raise FileNotFoundError(f"Project options TOML not found: {project_path}")
-
-    # Load TOML and extract canonical grid parameters
-    opts = load_project_options(project_path)
-    if "grid" not in opts:
-        raise KeyError("The project_options.toml is missing the [grid] section.")
+    # Load project options and resolve template path
+    opts = load_project_options(args.project_options)
+    log = setup_logging("prep_landuse_input", args.project_options.parent, no_log=args.no_log)
+    log.info(f"CLI arguments: {vars(args)}")
     grid = opts["grid"]
+    template_path = Path(grid["template_tif"])
+    if not template_path.is_absolute():
+        template_path = args.project_options.parent / template_path
 
-    grid_crs: str = str(grid["crs"])
-    resolution: float = float(grid["resolution"])
-    xmin: float = float(grid["xmin"])
-    ymin: float = float(grid["ymin"])
-    xmax: float = float(grid["xmax"])
-    ymax: float = float(grid["ymax"])
+    # Open template (carries authoritative CRS, transform, shape)
+    template = rxr.open_rasterio(template_path, masked=False).squeeze("band", drop=True)
 
-    # Build the target grid transform and shape
-    transform, (ny, nx) = _build_grid_affine_and_shape(xmin, ymin, xmax, ymax, resolution)
-    template = _make_grid_template(grid_crs, transform, (ny, nx))
+    # Open input landuse raster
+    lu_da = rxr.open_rasterio(args.input, masked=True).squeeze("band", drop=True)
 
-    # Read input landuse raster
-    landuse_da = read_raster_xr(args.input, masked=True)
+    # Align to template grid: CRS + extent + resolution in one call
+    resampling = RESAMPLING_METHODS[args.resampling]
+    lu_aligned = lu_da.rio.reproject_match(template, resampling=resampling)
 
-    # Reproject and align to the canonical grid
-    # Using rioxarray's reproject to target CRS first (if needed), then reproject_match to template.
-    if str(landuse_da.rio.crs) != _CRS.from_user_input(grid_crs).to_string():
-        landuse_da = landuse_da.rio.reproject(grid_crs)
+    # Replace excluded landuse codes with nodata (triggers SWB2 cell inactivation)
+    if args.exclude_codes:
+        arr = lu_aligned.values.copy()
+        for code in args.exclude_codes:
+            arr[arr == code] = args.nodata
+        lu_aligned = lu_aligned.copy(data=arr)
 
-    # Resample/align to the grid template (exact extent, resolution, and shape)
-    landuse_da_aligned = landuse_da.rio.reproject_match(template)
-
-    # Ensure dtype and nodata as requested
-    dtype: str = args.dtype
-    nodata_val: Optional[float] = args.nodata
-    landuse_typed = ensure_dtype_and_nodata(landuse_da_aligned, dtype=dtype, nodata=nodata_val)
+    # Enforce dtype and nodata
+    lu_typed = ensure_dtype_and_nodata(lu_aligned, dtype=args.dtype, nodata=args.nodata)
 
     # Build output filenames
-    units = str(opts.get("project", {}).get("units", "m"))
-    base = "landuse"
-    prefix = args.prefix if args.prefix else ""
-    geotiff_name = build_output_filename(base=base, resolution=resolution, units=units, ext=".tif", prefix=prefix)
-    ascii_name = build_output_filename(base=base, resolution=resolution, units=units, ext=".asc", prefix=prefix)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    resolution = float(abs(template.rio.transform().a))
+    units = opts.get("project", {}).get("units", "m")
+
+    tif_name = build_output_filename("landuse", resolution, units, ".tif", args.prefix or None)
+    asc_name = build_output_filename("landuse", resolution, units, ".asc", args.prefix or None)
 
     # Write GeoTIFF
-    out_dir: Path = args.output_dir
-    out_dir.mkdir(parents=True, exist_ok=True)
-    geotiff_path = out_dir / geotiff_name
-    write_geotiff_xr(
-        geotiff_path,
-        landuse_typed,
-        dtype=dtype,
-        nodata=nodata_val,
-        compress=args.compress,
-        tiled=True,
-    )
+    tif_path = args.output_dir / tif_name
+    write_geotiff_xr(tif_path, lu_typed, dtype=args.dtype, nodata=args.nodata,
+                     compress=args.compress, tiled=True)
+    log.info(f"Wrote: {tif_path}")
 
-    print(f"Wrote landuse GeoTIFF: {geotiff_path}")
-
-    # Optionally write ESRI Arc ASCII
-    if args.write_asc:
-        write_arc_ascii(
-            out_dir / ascii_name,
-            landuse_typed,
-            dtype=dtype,
-            nodata=nodata_val,
-            transform=transform,
-            crs=grid_crs,
-            decimal_precision=None,
-            significant_digits=None,
-            force_cellsize=None,
-        )
-        print(f"Wrote landuse Arc ASCII: {out_dir / ascii_name}")
+    # Write Arc ASCII
+    asc_path = args.output_dir / asc_name
+    write_arc_ascii(asc_path, lu_typed, dtype=args.dtype, nodata=args.nodata,
+                    transform=template.rio.transform(), crs=str(template.rio.crs))
+    log.info(f"Wrote: {asc_path}")
+    template.close(); lu_aligned.close(); lu_typed.close()
+    del template; del lu_aligned; del lu_typed
+    gc.collect()
 
 
 if __name__ == "__main__":

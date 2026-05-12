@@ -11,9 +11,9 @@ set OUTPUT_DIR=output
   --project-options "%PROJECT_OPTIONS%" ^
   --input "%INPUT%" ^
   --output-dir "%OUTPUT_DIR%" ^
-  --dtype uint16 ^
-  --nodata 0 ^
-  --write-asc ^
+  --dtype int16 ^
+  --nodata -1 ^
+  --exclude-codes 111 ^
   --prefix south_manitou
 
 if errorlevel 1 (
