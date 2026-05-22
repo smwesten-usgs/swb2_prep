@@ -25,9 +25,7 @@ Notes
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional, Union, Tuple, Dict
-
-import os
+from typing import Optional, Union
 
 import numpy as np
 import xarray as xr
@@ -38,10 +36,8 @@ from swb2_prep.common.utils import PathLike
 
 __all__ = [
     "read_raster_xr",
-    "read_raster",
     "ensure_dtype_and_nodata",
     "write_geotiff_xr",
-    "write_geotiff",
     "write_arc_ascii",
     "lower_left_to_transform",
 ]

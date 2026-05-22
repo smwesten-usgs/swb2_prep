@@ -14,8 +14,6 @@ from __future__ import annotations
 from typing import Iterable
 import xarray as xr
 import geopandas as gpd
-from shapely.geometry import box
-from pyproj import CRS as _CRS
 from swb2_prep.common.utils import crs_equal
 
 
@@ -76,29 +74,3 @@ def clip_raster_to_polygon_xr(
     return clipped
 
 
-def create_polygon_from_bbox(
-    xmin: float,
-    ymin: float,
-    xmax: float,
-    ymax: float,
-    crs: CRSLike,
-) -> gpd.GeoDataFrame:
-    """Create a single-row polygon GeoDataFrame from a bounding box.
-
-    Args:
-        xmin: Minimum x-coordinate of the bounding box.
-        ymin: Minimum y-coordinate of the bounding box.
-        xmax: Maximum x-coordinate of the bounding box.
-        ymax: Maximum y-coordinate of the bounding box.
-        crs: Coordinate reference system for the polygon (EPSG string, PROJ dict, or :class:`pyproj.CRS`).
-
-    Returns:
-        A GeoDataFrame containing one polygon row with the requested CRS.
-
-    Notes:
-        This helper is used by CLI workflows to derive an Area of Interest (AOI)
-        polygon from raw numeric extents prior to reprojection, clipping, and IO. [1](https://doimspp-my.sharepoint.com/personal/smwesten_usgs_gov/Documents/Microsoft%20Copilot%20Chat%20Files/test_paths.py)
-    """
-    polygon = box(xmin, ymin, xmax, ymax)
-    gdf = gpd.GeoDataFrame({"geometry": [polygon]}, crs=crs)
-    return gdf

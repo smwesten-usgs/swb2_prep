@@ -21,8 +21,6 @@ import numpy as np
 import xarray as xr
 import geopandas as gpd
 from rasterio.warp import Resampling
-from shapely.geometry import box
-from typing import Tuple
 from swb2_prep.common.utils import CRSLike
 
 def reproject_raster_xr(
@@ -136,37 +134,6 @@ def reproject_polygon(
     return gdf.to_crs(target_crs)
 
 
-def create_polygon_from_bbox(xmin: float, ymin: float, xmax: float, ymax: float, crs: str):
-    """
-    Create a GeoDataFrame polygon from a bounding box.
-
-    Parameters
-    ----------
-    xmin, ymin, xmax, ymax : float
-        Bounding-box coordinates representing the area of interest.
-        Assumed to be in the PROJECT CRS (Option B1).
-    crs : str
-        The CRS for the polygon (e.g., "EPSG:5070").
-
-    Returns
-    -------
-    geopandas.GeoDataFrame
-        A single-row GeoDataFrame containing the bounding-box polygon.
-
-    Notes
-    -----
-    This supports the CLI mode:
-
-        --bbox xmin ymin xmax ymax
-
-    as an alternative to loading a polygon shapefile.
-
-    All coordinates are assumed to already be in the project CRS.
-    """
-    geom = box(xmin, ymin, xmax, ymax)
-    return gpd.GeoDataFrame({"geometry": [geom]}, crs=crs)
-
-
 def snap_extent(
     xmin_raw: float,
     ymin_raw: float,
@@ -174,7 +141,7 @@ def snap_extent(
     ymax_raw: float,
     resolution: float,
     mode: str = "outward",
-) -> Tuple[float, float, float, float]:
+) -> tuple[float, float, float, float]:
     """Snap raw extent to a resolution grid.
 
     Args:
@@ -186,7 +153,7 @@ def snap_extent(
         mode: Snapping mode: ``'outward'`` (expand) or ``'inward'`` (shrink).
 
     Returns:
-        Tuple of ``(xmin, ymin, xmax, ymax)`` representing snapped extent.
+        tuple of ``(xmin, ymin, xmax, ymax)`` representing snapped extent.
 
     Raises:
         ValueError: If ``resolution`` is non-positive or the snapped extent collapses.
@@ -223,7 +190,7 @@ def compute_grid_dims(
     xmax: float,
     ymax: float,
     resolution: float,
-) -> Tuple[int, int]:
+) -> tuple[int, int]:
     """Compute grid dimensions (nx, ny) from snapped extent and resolution.
 
     Args:
@@ -234,7 +201,7 @@ def compute_grid_dims(
         resolution: Cell size (units of the CRS).
 
     Returns:
-        Tuple of ``(nx, ny)`` where ``nx`` is columns and ``ny`` is rows.
+        tuple of ``(nx, ny)`` where ``nx`` is columns and ``ny`` is rows.
 
     Raises:
         ValueError: If ``resolution`` is non-positive or extent is invalid.

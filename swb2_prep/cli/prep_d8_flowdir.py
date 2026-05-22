@@ -1,6 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Compute D8 flow direction from a DEM and align to the canonical SWB grid template.
+Compute D8 flow direction from a DEM aligned to the canonical SWB grid template.
+
+Workflow:
+1. Reproject/resample the input DEM to match the grid template (CRS, extent,
+   resolution) using bilinear interpolation (appropriate for continuous data).
+2. Run pysheds resolve_flats + flowdir on the aligned DEM.
+3. Write the D8 result directly — no post-resampling of categorical codes.
 
 Uses pysheds to resolve flats and compute flow direction with the dirmap
 encoding expected by SWB2: (64, 128, 1, 2, 4, 8, 16, 32).
@@ -17,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -52,24 +59,29 @@ def parse_args() -> argparse.Namespace:
                         help="Path to project_options.toml (default: ./project_options.toml).")
     parser.add_argument("--output-dir", dest="output_dir", type=Path, default=Path.cwd(),
                         help="Output directory (default: current directory).")
-    parser.add_argument("--dtype", type=str, default="uint8",
-                        help="Output dtype (default: uint8).")
-    parser.add_argument("--nodata", type=int, default=0,
-                        help="NoData value (default: 0).")
+    parser.add_argument("--dtype", type=str, default="int16",
+                        help="Output dtype (default: int16).")
+    parser.add_argument("--nodata", type=int, default=-9999,
+                        help="NoData value for D8 output (default: -9999).")
     parser.add_argument("--compress", type=str, default="lzw",
                         help="GeoTIFF compression (default: lzw).")
     parser.add_argument("--prefix", type=str, default="",
                         help="Optional filename prefix (e.g., project label).")
     parser.add_argument("--resampling", type=str, choices=list(RESAMPLING_METHODS.keys()),
-                        default="nearest",
-                        help="Resampling method (default: nearest).")
+                        default="bilinear",
+                        help="Resampling method for DEM alignment (default: bilinear).")
+    parser.add_argument("--no-resolve-flats", dest="resolve_flats", action="store_false",
+                        default=True,
+                        help="Skip pysheds resolve_flats before computing flow direction. "
+                             "Not recommended — resampling typically introduces flats that "
+                             "pysheds cannot route without this step.")
     parser.add_argument("--no-log", dest="no_log", action="store_true", default=False,
                         help="Suppress logging to file.")
     return parser.parse_args()
 
 
 def main() -> None:
-    """Compute D8 flow direction from DEM and align to the grid template."""
+    """Resample DEM to grid template, then compute D8 flow direction."""
     args = parse_args()
 
     # Load project options and resolve template path
@@ -84,39 +96,56 @@ def main() -> None:
     # Open template (authoritative CRS, transform, shape)
     template = rxr.open_rasterio(template_path, masked=False).squeeze("band", drop=True)
 
-    # Use pysheds to compute flow direction
+    # Read input DEM and reproject/resample to match template grid
     log.info(f"Loading DEM from: {args.input}")
-    pysheds_grid = Grid.from_raster(str(args.input))
-    dem = pysheds_grid.read_raster(str(args.input))
+    dem_da = rxr.open_rasterio(args.input, masked=True).squeeze("band", drop=True)
 
-    # Resolve flats
-    log.info("Resolving flats in DEM...")
-    inflated_dem = pysheds_grid.resolve_flats(dem)
+    resampling = RESAMPLING_METHODS[args.resampling]
+    log.info(f"Reprojecting DEM to template grid ({args.resampling} resampling)...")
+    dem_aligned = dem_da.rio.reproject_match(template, resampling=resampling)
 
-    # Compute D8 flow direction
+    # Write aligned DEM to a temporary GeoTIFF for pysheds
+    with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as tmp:
+        tmp_dem_path = Path(tmp.name)
+
+    dem_aligned.rio.to_raster(tmp_dem_path, driver="GTiff")
+    log.info(f"Wrote temporary aligned DEM: {tmp_dem_path}")
+
+    # Run pysheds on the aligned DEM
+    log.info("Loading aligned DEM into pysheds...")
+    pysheds_grid = Grid.from_raster(str(tmp_dem_path))
+    dem_pysheds = pysheds_grid.read_raster(str(tmp_dem_path))
+
+    if args.resolve_flats:
+        log.info("Resolving flats in resampled DEM...")
+        dem_pysheds = pysheds_grid.resolve_flats(dem_pysheds)
+    else:
+        log.info("Skipping resolve_flats (--no-resolve-flats specified).")
+
     log.info(f"Computing D8 flow direction with dirmap={DIRMAP}...")
-    fdir = pysheds_grid.flowdir(inflated_dem, dirmap=DIRMAP)
+    fdir = pysheds_grid.flowdir(dem_pysheds, dirmap=DIRMAP)
 
-    # Read the input DEM with rioxarray to get spatial metadata
-    dem_da = rxr.open_rasterio(args.input, masked=False).squeeze("band", drop=True)
+    # Clean up temporary file
+    tmp_dem_path.unlink(missing_ok=True)
 
-    # Wrap flow direction result as xarray DataArray
-    fdir_array = np.asarray(fdir, dtype=np.uint8)
+    # Wrap flow direction result as xarray DataArray with template spatial metadata
+    fdir_array = np.asarray(fdir, dtype=np.int16)
+
+    # Remap pysheds internal values (not valid D8 codes) to nodata
+    valid_codes = set(DIRMAP)
+    invalid_mask = ~np.isin(fdir_array, list(valid_codes))
+    fdir_array[invalid_mask] = args.nodata
     fdir_da = xr.DataArray(
         fdir_array,
-        dims=dem_da.dims,
-        coords=dem_da.coords,
+        dims=dem_aligned.dims,
+        coords=dem_aligned.coords,
     )
-    fdir_da = fdir_da.rio.write_crs(dem_da.rio.crs)
-    fdir_da = fdir_da.rio.write_transform(dem_da.rio.transform())
+    fdir_da = fdir_da.rio.write_crs(dem_aligned.rio.crs)
+    fdir_da = fdir_da.rio.write_transform(dem_aligned.rio.transform())
     fdir_da = fdir_da.rio.write_nodata(args.nodata)
 
-    # Align to template grid
-    resampling = RESAMPLING_METHODS[args.resampling]
-    fdir_aligned = fdir_da.rio.reproject_match(template, resampling=resampling, nodata=args.nodata)
-
     # Enforce dtype and nodata
-    fdir_typed = ensure_dtype_and_nodata(fdir_aligned, dtype=args.dtype, nodata=args.nodata)
+    fdir_typed = ensure_dtype_and_nodata(fdir_da, dtype=args.dtype, nodata=args.nodata)
 
     # Build output filenames
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -138,9 +167,9 @@ def main() -> None:
                     transform=template.rio.transform(), crs=str(template.rio.crs))
     log.info(f"Wrote: {asc_path}")
 
-    # Cleanup to avoid shutdown errors
-    template.close(); fdir_da.close(); fdir_aligned.close(); fdir_typed.close()
-    del template; del fdir_da; del fdir_aligned; del fdir_typed
+    # Cleanup
+    template.close(); dem_aligned.close(); fdir_da.close(); fdir_typed.close()
+    del template; del dem_aligned; del fdir_da; del fdir_typed
     gc.collect()
 
 

@@ -11,8 +11,9 @@ set OUTPUT_DIR=output
   --project-options "%PROJECT_OPTIONS%" ^
   --input "%INPUT%" ^
   --output-dir "%OUTPUT_DIR%" ^
-  --dtype uint8 ^
-  --nodata 0 ^
+  --dtype int16 ^
+  --nodata -9999 ^
+  --resampling bilinear ^
   --prefix south_manitou
 
 if errorlevel 1 (

@@ -19,9 +19,7 @@ from shapely.geometry import Polygon
 from rasterio.transform import from_origin
 import xarray as xr
 
-from swb2_prep.common.ops import (
-    create_polygon_from_bbox,
-)
+from shapely.geometry import box
 from swb2_prep.common.grids import (
     reproject_raster_xr,
     reproject_polygon,
@@ -39,7 +37,8 @@ def test_create_polygon_from_bbox():
     - Bounds match the inputs.
     - CRS equals the requested EPSG.
     """
-    gdf = create_polygon_from_bbox(0, 0, 10, 5, "EPSG:5070")
+    polygon = box(0, 0, 10, 5)
+    gdf = gpd.GeoDataFrame({"geometry": [polygon]}, crs="EPSG:5070")
 
     assert len(gdf) == 1
     poly = gdf.geometry.iloc[0]
