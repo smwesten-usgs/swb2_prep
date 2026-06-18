@@ -281,23 +281,80 @@ class TestResolution:
         assert grid["nx"] > 0 and grid["ny"] > 0
 
 
+class TestInputDir:
+    """Tests for --input-dir argument and absolute path storage."""
+
+    def test_paths_stored_as_absolute(self, data_dir: Path, tmp_path: Path, out_dir: Path):
+        """Verify that input_dir, output_dir, and template_tif are absolute paths.
+
+        Purpose: Ensure the TOML is self-contained and can be read from any
+        working directory without path resolution issues.
+
+        Expected outcome:
+        - Exit code 0.
+        - [paths].input_dir is an absolute path.
+        - [paths].output_dir is an absolute path.
+        - [grid].template_tif is an absolute path.
+        """
+        toml_path = tmp_path / "project_options.toml"
+        input_dir = tmp_path / "my_data"
+        input_dir.mkdir()
+
+        rc, out, err = _run([
+            "--polygon", (data_dir / "aoi.shp").as_posix(),
+            "--epsg", "EPSG:5070",
+            "--resolution", "30",
+            "--input-dir", input_dir.as_posix(),
+            "--project-options", toml_path.as_posix(),
+            "--output-dir", out_dir.as_posix(),
+        ])
+        assert rc == 0, f"Failed: {err}"
+        opts = _load_toml(toml_path)
+        assert Path(opts["paths"]["input_dir"]).is_absolute()
+        assert Path(opts["paths"]["output_dir"]).is_absolute()
+        assert Path(opts["grid"]["template_tif"]).is_absolute()
+
+    def test_input_dir_value(self, data_dir: Path, tmp_path: Path, out_dir: Path):
+        """Verify --input-dir value is stored correctly.
+
+        Expected outcome:
+        - [paths].input_dir resolves to the directory passed via --input-dir.
+        """
+        toml_path = tmp_path / "project_options.toml"
+        input_dir = tmp_path / "custom_input"
+        input_dir.mkdir()
+
+        rc, out, err = _run([
+            "--polygon", (data_dir / "aoi.shp").as_posix(),
+            "--epsg", "EPSG:5070",
+            "--resolution", "30",
+            "--input-dir", input_dir.as_posix(),
+            "--project-options", toml_path.as_posix(),
+            "--output-dir", out_dir.as_posix(),
+        ])
+        assert rc == 0, f"Failed: {err}"
+        opts = _load_toml(toml_path)
+        assert Path(opts["paths"]["input_dir"]) == input_dir.resolve()
+
+
 # ---------- Error cases ----------
 
 class TestErrors:
     """Tests for expected error conditions."""
 
-    def test_file_already_exists(self, data_dir: Path, tmp_path: Path, out_dir: Path):
-        """Attempt to create project_options.toml when it already exists.
+    def test_merge_preserves_existing_sections(self, data_dir: Path, tmp_path: Path, out_dir: Path):
+        """Run swb2-prep-grid when project_options.toml already has other sections.
 
-        Purpose: Verify create-only semantics — the CLI must refuse to
-        overwrite an existing file to prevent accidental data loss.
+        Purpose: Verify merge semantics — existing sections not owned by
+        define_swb_grid are preserved after the run.
 
         Expected outcome:
-        - Non-zero exit code.
-        - stderr contains 'already exists'.
+        - Exit code 0.
+        - Pre-existing [landuse] section is preserved in the output file.
+        - [grid] section is written with correct values.
         """
         toml_path = tmp_path / "project_options.toml"
-        toml_path.write_text("[project]\n")  # pre-existing file
+        toml_path.write_text('[landuse]\ncode = 42\nlabel = "forest"\n')
 
         rc, out, err = _run([
             "--polygon", (data_dir / "aoi.shp").as_posix(),
@@ -306,8 +363,69 @@ class TestErrors:
             "--project-options", toml_path.as_posix(),
             "--output-dir", out_dir.as_posix(),
         ])
+        assert rc == 0, f"Failed: {err}"
+        opts = _load_toml(toml_path)
+        assert opts["landuse"] == {"code": 42, "label": "forest"}
+        assert "grid" in opts
+        assert opts["grid"]["resolution"] == 30.0
+
+    def test_merge_no_conflict_same_grid(self, data_dir: Path, tmp_path: Path, out_dir: Path):
+        """Run swb2-prep-grid twice with identical parameters.
+
+        Purpose: Verify that re-running with the same grid parameters succeeds
+        (no conflict when values are identical).
+
+        Expected outcome:
+        - Both runs exit 0.
+        - TOML is valid after second run.
+        """
+        toml_path = tmp_path / "project_options.toml"
+        common_args = [
+            "--polygon", (data_dir / "aoi.shp").as_posix(),
+            "--epsg", "EPSG:5070",
+            "--resolution", "30",
+            "--project-options", toml_path.as_posix(),
+            "--output-dir", out_dir.as_posix(),
+        ]
+        rc1, _, err1 = _run(common_args)
+        assert rc1 == 0, f"First run failed: {err1}"
+
+        rc2, _, err2 = _run(common_args)
+        assert rc2 == 0, f"Second run failed: {err2}"
+        opts = _load_toml(toml_path)
+        assert opts["grid"]["nx"] > 0
+
+    def test_merge_conflict_different_resolution(self, data_dir: Path, tmp_path: Path, out_dir: Path):
+        """Run swb2-prep-grid when existing [grid] has a conflicting resolution.
+
+        Purpose: Verify conflict detection — the CLI must error if existing
+        [grid] values contradict the current computation.
+
+        Expected outcome:
+        - Non-zero exit code.
+        - stderr contains 'conflict'.
+        """
+        toml_path = tmp_path / "project_options.toml"
+        # First run at 30m
+        rc, _, err = _run([
+            "--polygon", (data_dir / "aoi.shp").as_posix(),
+            "--epsg", "EPSG:5070",
+            "--resolution", "30",
+            "--project-options", toml_path.as_posix(),
+            "--output-dir", out_dir.as_posix(),
+        ])
+        assert rc == 0, f"First run failed: {err}"
+
+        # Second run at 100m — should conflict
+        rc, _, err = _run([
+            "--polygon", (data_dir / "aoi.shp").as_posix(),
+            "--epsg", "EPSG:5070",
+            "--resolution", "100",
+            "--project-options", toml_path.as_posix(),
+            "--output-dir", out_dir.as_posix(),
+        ])
         assert rc != 0
-        assert "already exists" in err
+        assert "conflict" in err.lower()
 
     def test_both_epsg_and_proj4(self, data_dir: Path, tmp_path: Path, out_dir: Path):
         """Provide both --epsg and --proj4 simultaneously.

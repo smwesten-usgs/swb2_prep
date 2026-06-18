@@ -1,4 +1,4 @@
-@echo off
+::@echo off
 REM Prepare AWC raster (inches/foot) aligned to the canonical grid from project_options.toml.
 setlocal
 

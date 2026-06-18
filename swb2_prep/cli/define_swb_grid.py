@@ -9,7 +9,8 @@ This CLI:
 - Writes project_options.toml with the canonical [grid] section.
 - Optionally writes a shapefile of the grid bounding box.
 
-Create-only: errors if project_options.toml already exists.
+Merge semantics: if project_options.toml already exists, merge new content into
+it. Errors if any existing [grid] keys conflict with the computed values.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ import geopandas as gpd
 import numpy as np
 import rasterio as rio
 import toml
+import tomllib
 from pyproj import CRS as _CRS
 from rasterio.transform import Affine
 
@@ -32,7 +34,7 @@ from swb2_prep.common.log import setup_logging
 def parse_args() -> argparse.Namespace:
     """Parse CLI arguments for grid definition."""
     p = argparse.ArgumentParser(
-        description="Create project_options.toml with canonical [grid]. Errors if file exists."
+        description="Create/update project_options.toml with canonical [grid]."
     )
     # AOI source (mutually exclusive in practice)
     p.add_argument("--polygon", type=Path, help="AOI polygon shapefile.")
@@ -51,6 +53,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--resolution", type=float, required=True, help="Grid cell size in CRS units.")
     p.add_argument("--snap", choices=["outward", "inward"], default="outward",
                    help="Snap mode (default: outward).")
+
+    # Paths
+    p.add_argument("--input-dir", dest="input_dir", type=Path, default=Path.cwd() / "data",
+                   help="Directory containing input data (default: ./data). Stored as absolute path.")
 
     # Output
     p.add_argument("--project-options", dest="project_options", type=Path,
@@ -146,6 +152,21 @@ def write_grid_template_tif(out_dir: Path, grid: dict) -> Path:
     return path
 
 
+def check_grid_conflicts(existing: dict, new: dict) -> list[str]:
+    """Check for conflicts between existing and new [grid] values.
+
+    Returns a list of conflict descriptions. Empty list means no conflicts.
+    """
+    conflicts = []
+    for key, new_val in new.items():
+        if key not in existing:
+            continue
+        old_val = existing[key]
+        if old_val != new_val:
+            conflicts.append(f"  [grid].{key}: existing={old_val!r}, new={new_val!r}")
+    return conflicts
+
+
 def main() -> None:
     """Define the SWB grid and write project_options.toml + template GeoTIFF."""
     args = parse_args()
@@ -153,12 +174,6 @@ def main() -> None:
     # Set up logging (log to project_options parent dir)
     log = setup_logging("define_swb_grid", args.project_options.parent, no_log=args.no_log)
     log.info(f"CLI arguments: {vars(args)}")
-
-    # Enforce create-only
-    if args.project_options.exists():
-        raise FileExistsError(
-            f"{args.project_options} already exists. Remove or rename it first."
-        )
 
     # Resolve CRS
     if args.epsg and args.proj4:
@@ -199,14 +214,34 @@ def main() -> None:
     }
 
     # Write template GeoTIFF
-    template_path = write_grid_template_tif(args.output_dir, grid)
-    grid["template_tif"] = str(template_path)
+    template_path = write_grid_template_tif(args.output_dir.resolve(), grid)
+    grid["template_tif"] = str(template_path.resolve())
     log.info(f"Wrote grid template: {template_path}")
 
-    # Write project_options.toml
-    project_opts = {
+    # Load existing TOML if present, and check for [grid] conflicts
+    existing_opts = {}
+    if args.project_options.exists():
+        with args.project_options.open("rb") as f:
+            existing_opts = tomllib.load(f)
+
+        if "grid" in existing_opts:
+            conflicts = check_grid_conflicts(existing_opts["grid"], grid)
+            if conflicts:
+                msg = (
+                    f"{args.project_options} already contains [grid] values that "
+                    f"conflict with the current run:\n" + "\n".join(conflicts)
+                )
+                raise ValueError(msg)
+
+        log.info(f"Merging into existing: {args.project_options}")
+
+    # Build new sections
+    new_opts = {
         "project": {"crs": canonical_crs, "resolution": resolution, "units": "m"},
-        "paths": {"input_dir": "data", "output_dir": str(args.output_dir)},
+        "paths": {
+            "input_dir": str(args.input_dir.resolve()),
+            "output_dir": str(args.output_dir.resolve()),
+        },
         "aoi": {
             "bbox": list(args.bbox) if args.bbox else [],
             "polygon": str(args.polygon) if args.polygon else "",
@@ -220,23 +255,28 @@ def main() -> None:
             "version": "0.1.0",
         },
     }
+
+    # Merge: existing sections preserved, new sections overwrite what define_swb_grid owns
+    merged = {**existing_opts, **new_opts}
+
     with args.project_options.open("w", encoding="utf-8") as f:
-        toml.dump(project_opts, f)
+        toml.dump(merged, f)
 
     # Summary
-    log.info(f"Created: {args.project_options}")
-    log.info(f"Created swb grid:")
+    log.info(f"Wrote: {args.project_options}")
     log.info(f"  CRS:        {canonical_crs}")
     log.info(f"  Resolution: {resolution}")
     log.info(f"  Extent:     ({xmin}, {ymin}) – ({xmax}, {ymax})")
     log.info(f"  Dimensions: {nx} x {ny}")
     log.info(f"  Snap:       {args.snap}")
+    log.info(f"  Input dir:  {args.input_dir.resolve()}")
+    log.info(f"  Output dir: {args.output_dir.resolve()}")
 
     # Optional: write grid bounding box shapefile
     if args.output_shapefile:
         from shapely.geometry import box
         gdf = gpd.GeoDataFrame({"geometry": [box(xmin, ymin, xmax, ymax)]}, crs=canonical_crs)
-        shp_path = args.output_dir / str(args.output_shapefile)
+        shp_path = args.output_dir.resolve() / str(args.output_shapefile)
         gdf.to_file(shp_path)
         log.info(f"Wrote grid shapefile: {shp_path}")
 
